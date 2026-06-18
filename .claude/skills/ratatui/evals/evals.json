@@ -1,0 +1,26 @@
+{
+  "skill_name": "ratatui",
+  "evals": [
+    {
+      "id": 0,
+      "name": "scrollable-list-app",
+      "prompt": "Using Rust and ratatui, write me a small terminal app: a bordered box titled \"Tasks\" containing a scrollable, selectable list of strings, with a one-line footer at the bottom showing the keybindings. Up/Down (and j/k) move the selection, q or Esc quits. Give me a complete main.rs I can cargo run, and a Cargo.toml.",
+      "expected_output": "A complete, compiling ratatui 0.30 app using List + ListState, a Layout with a footer, as_key_press_event filtering, ratatui::run.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "llm-chat-input",
+      "prompt": "I'm building an LLM agent CLI in Rust with ratatui. I need the message-input box at the bottom of the screen: it should grow vertically as the user types more lines (up to ~6 rows), send the message when they press Enter, and insert a newline on Alt+Enter instead of sending. Pasting a multi-line block should not trigger a send. Show me how to build the input widget and wire the key handling.",
+      "expected_output": "Auto-growing input via wrapped-line height + Layout, Enter-to-send vs Alt+Enter newline, bracketed paste handling, set_cursor_position each frame. Matches the 06-text-editing chat input.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "custom-widget",
+      "prompt": "In ratatui (latest), how do I write a reusable custom widget? I want a labeled status indicator I can keep in my app state and render each frame from a &self reference (so rendering doesn't consume it). Give me the trait impl and how I'd render it.",
+      "expected_output": "impl Widget for &MyWidget (the 0.30 idiom), NOT WidgetRef. Rendered via frame.render_widget(&self.x, area).",
+      "files": []
+    }
+  ]
+}
