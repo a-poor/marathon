@@ -160,7 +160,41 @@ ratatui (0.30) + ratatui-textarea + crossterm.
 > Implementation note: use the **ratatui** skill — the 0.30 API differs
 > substantially from pre-0.30 material in model training data.
 
-## 7. Deferred / future ideas (explicitly out of MVP)
+## 7. Output & ANSI handling (tentative — under review)
+
+> **Status: not fixed.** Captured below as a future consideration / working
+> direction. Needs further review before it's settled.
+
+Cell output is captured for display (and exit code for control flow); output is
+**not** bound to variables in the MVP (see §4, and the GitHub-Actions capture
+deferral in §8). Tentative direction:
+
+- **Streaming, merged by default.** Stream stdout+stderr live (piped
+  `tokio::process::Command`), merged into one stream by default. Per-cell sinks are
+  configurable, e.g. `stdout=/dev/null` / `stderr=...`. Color is a configurable
+  toggle.
+- **Merge tradeoff (no pty in MVP).** Merging at the source (`2>&1` / shared fd)
+  gives true ordering but loses which-stream-is-which; two pipes into one sink keep
+  the distinction but order is best-effort. A pty (deferred, see §8) is what closes
+  that gap. Leaning: two-pipe/tagged for the TUI so stderr can be styled; a merged
+  `run.log` is a possible later add.
+- **Sanitize at the TUI boundary only.** In CLI mode, pass raw bytes through (the
+  real terminal interprets ANSI). In TUI mode, ratatui does **not** interpret ANSI,
+  so sanitize when rendering:
+  - SGR color/style (`\x1b[…m`) → parse to ratatui styles when color is on, strip
+    when off.
+  - All other escapes (cursor moves, `\x1b[2J`/`\x1b[K`, OSC title, C0/C1 controls)
+    → **always strip** — these corrupt the TUI.
+  - Normalize `\r` (collapse progress-bar rewrites to the final segment) and expand
+    tabs.
+- **Color at the source.** Color-off can also set `NO_COLOR=1` in the child env
+  (force-on via `CLICOLOR_FORCE=1`) so many tools emit no SGR at all; still strip
+  defensively.
+- Candidate crates: `strip-ansi-escapes` (color-off path), `ansi-to-tui` (color-on
+  path). Full fidelity (`vt100`/`vte`/`tui-term` screen grid) is the pty upgrade,
+  not MVP.
+
+## 8. Deferred / future ideas (explicitly out of MVP)
 
 Kept here so the MVP stays small but the door stays open:
 
@@ -174,7 +208,7 @@ Kept here so the MVP stays small but the door stays open:
 - **Richer special blocks** — additional `mrthn=` render/input types.
 - **`TMP_DIR` retention / run dir** options beyond the basic flag.
 
-## 8. Current code state
+## 9. Current code state
 
 Early scaffold. `cli::App` has no subcommands yet; `book::BookFrontmatter` is empty
 and `book::CodeBlockMeta` has only `skip`; `widget_markdown::render_md_node` is a
