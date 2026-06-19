@@ -3,4 +3,5 @@ pub mod cli;
 pub mod runner;
 pub mod term;
 pub mod tui;
-pub mod widget_markdown;
+pub(crate) mod util;
+pub mod widgets;
