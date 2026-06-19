@@ -13,6 +13,11 @@ layered on top of standard markdown rather than introducing custom syntax.
 This is an early-stage scaffold. Most modules (`term.rs`, `tui.rs`) are empty, and
 `widget_markdown.rs` is a `todo!()` skeleton. Expect to implement, not just extend.
 
+**Read `DESIGN.md` first.** It is the authoritative design for the MVP — the cell
+model, the layering of config (frontmatter → info-string `key=value` → special
+`json mrthn=...` blocks), the env/state model, the CLI surface, and what is
+deliberately deferred. This `CLAUDE.md` only summarizes; `DESIGN.md` decides.
+
 ## Commands
 
 ```sh
@@ -55,3 +60,10 @@ executes non-skipped code blocks.
 - When working on the TUI, use the **ratatui** skill — the project pins ratatui
   0.30, whose API differs significantly from pre-0.30 versions in training data.
 - Keep runbook files valid standalone markdown; do not invent non-standard syntax.
+
+## Git
+
+- **Do not make any git changes without explicit permission from the user.** This
+  includes `commit`, `add`/staging, `branch`, `push`, `restore`, `reset`, and any
+  other state-changing git command. Read-only inspection (`status`, `diff`, `log`)
+  is fine. Ask first, then act only on an explicit go-ahead.
