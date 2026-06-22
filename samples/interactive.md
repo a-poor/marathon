@@ -29,9 +29,9 @@ under the name given by `target` (`CHOICE`), so every cell *after* this one can 
 ```json mrthn=input
 {
   "type": "select",
-  "multiple": false,
-  "options": "$TMP_DIR/choices.txt",
-  "target": "CHOICE"
+  "prompt": "Which option do you want?",
+  "target": "CHOICE",
+  "option_file": "$TMP_DIR/choices.txt"
 }
 ```
 
@@ -41,3 +41,18 @@ under the name given by `target` (`CHOICE`), so every cell *after* this one can 
 echo "You picked: $CHOICE"
 curl -s -X POST "$BASE/api/order/$CHOICE"
 ```
+
+---
+
+What about just a select option?
+
+```json mrthn=input
+{
+  "type": "select",
+  "prompt": "Which option do you want?",
+  "target": "CHOICE",
+  "options": ["foo","bar","baz"]
+}
+```
+
+The end.

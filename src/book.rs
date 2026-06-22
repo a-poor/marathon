@@ -6,10 +6,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::util::{get_frontmatter_node, parse_markdown};
 
+/// An active runbook primitive.
 pub struct Runbook {
+    /// The path to the runbook
     pub path: Option<PathBuf>,
+
+    /// Runbook frontmatter
     pub frontmatter: BookFrontmatter,
+
+    /// Parsed blocks in the runbook
     pub blocks: Vec<BookBlock>,
+
+    /// Index of the last run code block
+    pub last_run: Option<usize>,
+
+    /// Active temp directory
+    pub tmp_dir: Option<PathBuf>,
 }
 
 impl Runbook {
@@ -24,13 +36,31 @@ impl Runbook {
         let txt = get_frontmatter_node(&ast)?;
         let frontmatter: BookFrontmatter = serde_yaml::from_str(&txt)?;
 
-        // Coerce the blocks
+        // Coerce the blocks. Frontmatter (YAML/TOML) is config, not content, so
+        // it isn't a navigable/rendered block.
         let blocks = ast
             .children
             .iter()
+            .filter(|n| {
+                !matches!(
+                    n,
+                    markdown::mdast::Node::Yaml(_) | markdown::mdast::Node::Toml(_)
+                )
+            })
             .map(|n| match n {
                 markdown::mdast::Node::Code(c) => {
+                    // Parse the code block
                     let b = CodeBlock::try_from(c.clone()).map_err(|err| anyhow!("{}", err))?;
+
+                    // Is it an input block?
+                    if b.lang == "json"
+                        && b.meta.mrthn.as_ref().map(|s| s == "input").unwrap_or(false)
+                    {
+                        let mib: MagicInputBlock = serde_json::from_str(&b.content)?;
+                        return Ok(BookBlock::Input(mib));
+                    }
+
+                    // Otherwise just runnable code
                     Ok(BookBlock::Code(b))
                 }
                 _ => Ok(BookBlock::Md(n.clone())),
@@ -42,13 +72,21 @@ impl Runbook {
             path,
             frontmatter,
             blocks,
+            last_run: None,
+            tmp_dir: None,
         })
+    }
+
+    #[allow(unused)]
+    fn load_tmp_dir(&mut self) -> Self {
+        todo!()
     }
 }
 
 #[derive(Debug)]
 pub enum BookBlock {
     Code(CodeBlock),
+    Input(MagicInputBlock),
     Md(markdown::mdast::Node),
 }
 
@@ -99,7 +137,7 @@ pub enum CodeBlockState {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BookFrontmatter {
     /// Configuration for code block interpreters
-    pub interpreters: HashMap<String, InterpreterConf>,
+    pub interpreters: Option<HashMap<String, InterpreterConf>>,
 
     /// Code to inject at the start of each code block
     pub before_each: Option<String>,
@@ -108,7 +146,7 @@ pub struct BookFrontmatter {
     pub after_each: Option<String>,
 
     /// Environment variables to set for each code block
-    pub env: HashMap<String, String>,
+    pub env: Option<HashMap<String, String>>,
 
     /// Config options for temp dir to be shared across
     /// code block runs.
@@ -117,7 +155,7 @@ pub struct BookFrontmatter {
     /// to pass messages between steps.
     ///
     /// An environment variable `$TMP_DIR` will be injected
-    pub tmp_dir: TmpDirConf,
+    pub tmp_dir: Option<TmpDirConf>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
