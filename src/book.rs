@@ -20,8 +20,12 @@ pub struct Runbook {
     /// Index of the last run code block
     pub last_run: Option<usize>,
 
-    /// Active temp directory
+    /// Active temp directory (the resolved path; see [`Runbook::ensure_tmp_dir`]).
     pub tmp_dir: Option<PathBuf>,
+
+    /// Keep-alive for an auto-created temp dir. Dropping it removes the directory,
+    /// so it must live as long as the runbook (unless `skip_cleanup` persisted it).
+    tmp_guard: Option<tempfile::TempDir>,
 }
 
 impl Runbook {
@@ -57,7 +61,7 @@ impl Runbook {
                         && b.meta.mrthn.as_ref().map(|s| s == "input").unwrap_or(false)
                     {
                         let mib: MagicInputBlock = serde_json::from_str(&b.content)?;
-                        return Ok(BookBlock::Input(mib));
+                        return Ok(BookBlock::Input(InputCell::new(mib)));
                     }
 
                     // Otherwise just runnable code
@@ -74,19 +78,133 @@ impl Runbook {
             blocks,
             last_run: None,
             tmp_dir: None,
+            tmp_guard: None,
         })
     }
 
-    #[allow(unused)]
-    fn load_tmp_dir(&mut self) -> Self {
-        todo!()
+    /// Mutable access to the input cell at `idx`, if that block is one.
+    pub fn input_at_mut(&mut self, idx: usize) -> Option<&mut InputCell> {
+        match self.blocks.get_mut(idx) {
+            Some(BookBlock::Input(cell)) => Some(cell),
+            _ => None,
+        }
+    }
+
+    /// Name of the env var pointing at the temp dir (`TMP_DIR` by default).
+    fn tmp_dir_var_name(&self) -> String {
+        self.frontmatter
+            .tmp_dir
+            .as_ref()
+            .and_then(|c| c.var_name.clone())
+            .unwrap_or_else(|| "TMP_DIR".to_string())
+    }
+
+    /// Resolve the shared temp directory, creating it on first use (DESIGN §4).
+    /// An explicit frontmatter `tmp_dir.path` is created as-is; otherwise a fresh
+    /// `mktemp`-style dir is made and (unless `skip_cleanup`) removed on drop.
+    pub fn ensure_tmp_dir(&mut self) -> Result<PathBuf> {
+        if let Some(p) = &self.tmp_dir {
+            return Ok(p.clone());
+        }
+
+        let explicit = self
+            .frontmatter
+            .tmp_dir
+            .as_ref()
+            .and_then(|c| c.path.clone());
+
+        let path = if let Some(p) = explicit {
+            std::fs::create_dir_all(&p)?;
+            p
+        } else {
+            let td = tempfile::TempDir::new()?;
+            let skip = self
+                .frontmatter
+                .tmp_dir
+                .as_ref()
+                .and_then(|c| c.skip_cleanup)
+                .unwrap_or(false);
+            if skip {
+                // Persist: leak the guard so the directory survives the run.
+                td.keep()
+            } else {
+                let p = td.path().to_path_buf();
+                self.tmp_guard = Some(td);
+                p
+            }
+        };
+
+        self.tmp_dir = Some(path.clone());
+        Ok(path)
+    }
+
+    /// The interpreter argv for a language, e.g. `["/usr/bin/env", "sh"]`. A
+    /// frontmatter `interpreters.<lang>.path` overrides the default (shebang-style
+    /// remap, so `sh` can be run with `zsh`).
+    pub fn interpreter_for(&self, lang: &str) -> Vec<String> {
+        if let Some(conf) = self
+            .frontmatter
+            .interpreters
+            .as_ref()
+            .and_then(|m| m.get(lang))
+            && let Some(path) = &conf.path
+        {
+            let parts: Vec<String> = path.split_whitespace().map(String::from).collect();
+            if !parts.is_empty() {
+                return parts;
+            }
+        }
+        vec!["/usr/bin/env".to_string(), lang.to_string()]
+    }
+
+    /// The full script for a cell: frontmatter `before_each`, the cell body, then
+    /// `after_each`, joined with newlines.
+    pub fn script_for(&self, c: &CodeBlock) -> String {
+        let mut s = String::new();
+        if let Some(b) = &self.frontmatter.before_each {
+            s.push_str(b);
+            if !b.ends_with('\n') {
+                s.push('\n');
+            }
+        }
+        s.push_str(&c.content);
+        if let Some(a) = &self.frontmatter.after_each {
+            if !s.is_empty() && !s.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str(a);
+        }
+        s
+    }
+
+    /// Build the environment map injected into the cell at `idx` (DESIGN §4):
+    /// frontmatter `env`, then `TMP_DIR`, then every *preceding* answered input
+    /// cell's `target=value` in document order (later answers win).
+    pub fn env_for(&self, idx: usize) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+
+        if let Some(env) = &self.frontmatter.env {
+            map.extend(env.clone());
+        }
+        if let Some(tmp) = &self.tmp_dir {
+            map.insert(self.tmp_dir_var_name(), tmp.display().to_string());
+        }
+        for block in self.blocks.iter().take(idx) {
+            if let BookBlock::Input(cell) = block
+                && let Some((target, value)) = cell.resolved()
+            {
+                map.insert(target.to_string(), value.to_string());
+            }
+        }
+
+        map
     }
 }
 
 #[derive(Debug)]
 pub enum BookBlock {
     Code(CodeBlock),
-    Input(MagicInputBlock),
+    Input(InputCell),
     Md(markdown::mdast::Node),
 }
 
@@ -98,6 +216,14 @@ pub struct CodeBlock {
     pub content: String,
     pub state: CodeBlockState,
     // more state?
+}
+
+impl CodeBlock {
+    /// Whether marathon will execute this cell: a recognized shell language and
+    /// not opted out via `skip=true`. Unknown languages are display-only (MVP).
+    pub fn is_runnable(&self) -> bool {
+        !self.meta.skip.unwrap_or(false) && matches!(self.lang.as_str(), "sh" | "bash" | "zsh")
+    }
 }
 
 impl TryFrom<markdown::mdast::Code> for CodeBlock {
@@ -268,4 +394,544 @@ pub enum MagicInputBlock {
         /// be used as options
         option_file: Option<String>,
     },
+}
+
+impl MagicInputBlock {
+    pub fn prompt(&self) -> &str {
+        match self {
+            Self::Confirm { prompt, .. }
+            | Self::Input { prompt, .. }
+            | Self::Select { prompt, .. } => prompt,
+        }
+    }
+
+    pub fn target(&self) -> &str {
+        match self {
+            Self::Confirm { target, .. }
+            | Self::Input { target, .. }
+            | Self::Select { target, .. } => target,
+        }
+    }
+
+    /// Short label for the cell kind, e.g. `confirm`/`input`/`select`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Confirm { .. } => "confirm",
+            Self::Input { .. } => "input",
+            Self::Select { .. } => "select",
+        }
+    }
+}
+
+/// A navigable input cell: the parsed [`MagicInputBlock`] config plus the live
+/// interaction state. Config is immutable for the session; `state` advances as
+/// the user activates, edits, and answers the cell.
+///
+/// Per the architecture notes, the *answered value* is model state (it belongs to
+/// the document and feeds later cells), while activation/draft is transient edit
+/// state that lives here only while the cell is focused.
+#[derive(Debug)]
+pub struct InputCell {
+    pub config: MagicInputBlock,
+    pub state: InputState,
+}
+
+/// Where an input cell is in its lifecycle.
+#[derive(Debug, Clone, Default)]
+pub enum InputState {
+    /// Not yet answered and not currently focused.
+    #[default]
+    Pending,
+    /// Focused and being edited. `prior` remembers a previous answer (if any) so
+    /// a cancelled re-edit can restore it.
+    Editing { draft: Draft, prior: Option<String> },
+    /// Answered; `value` is what gets written to the cell's target env var.
+    Answered { value: String },
+}
+
+/// The in-progress edit value, shaped by the cell kind.
+#[derive(Debug, Clone)]
+pub enum Draft {
+    /// Yes (`true`) / No (`false`) toggle.
+    Confirm(bool),
+    /// Free text with a cursor.
+    Text(TextDraft),
+    /// Highlighted option index into the cell's options.
+    Select(usize),
+}
+
+/// A single-line text buffer with a char-indexed cursor.
+#[derive(Debug, Clone, Default)]
+pub struct TextDraft {
+    pub value: String,
+    /// Cursor position as a *character* index (0..=char count).
+    pub cursor: usize,
+}
+
+impl TextDraft {
+    fn seeded(value: String) -> Self {
+        let cursor = value.chars().count();
+        Self { value, cursor }
+    }
+
+    /// Byte offset of char index `idx` (clamped to the end).
+    fn byte_at(&self, idx: usize) -> usize {
+        self.value
+            .char_indices()
+            .nth(idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.value.len())
+    }
+
+    fn char_count(&self) -> usize {
+        self.value.chars().count()
+    }
+
+    fn insert(&mut self, c: char) {
+        let at = self.byte_at(self.cursor);
+        self.value.insert(at, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let start = self.byte_at(self.cursor - 1);
+        let end = self.byte_at(self.cursor);
+        self.value.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor >= self.char_count() {
+            return;
+        }
+        let start = self.byte_at(self.cursor);
+        let end = self.byte_at(self.cursor + 1);
+        self.value.replace_range(start..end, "");
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.char_count());
+    }
+
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn end(&mut self) {
+        self.cursor = self.char_count();
+    }
+}
+
+impl InputCell {
+    pub fn new(config: MagicInputBlock) -> Self {
+        Self {
+            config,
+            state: InputState::Pending,
+        }
+    }
+
+    pub fn prompt(&self) -> &str {
+        self.config.prompt()
+    }
+
+    pub fn target(&self) -> &str {
+        self.config.target()
+    }
+
+    pub fn kind(&self) -> &'static str {
+        self.config.kind()
+    }
+
+    /// The select options (empty for non-select cells, or if none configured).
+    pub fn options(&self) -> &[String] {
+        match &self.config {
+            MagicInputBlock::Select {
+                options: Some(o), ..
+            } => o,
+            _ => &[],
+        }
+    }
+
+    fn option_at(&self, idx: usize) -> Option<&str> {
+        self.options().get(idx).map(String::as_str)
+    }
+
+    /// True if the cell is currently focused for editing.
+    pub fn is_editing(&self) -> bool {
+        matches!(self.state, InputState::Editing { .. })
+    }
+
+    /// The resolved `(target, value)` once answered — the seam later wired into
+    /// the env map. `None` until the cell has been answered.
+    pub fn resolved(&self) -> Option<(&str, &str)> {
+        match &self.state {
+            InputState::Answered { value } => Some((self.target(), value)),
+            _ => None,
+        }
+    }
+
+    /// Begin editing, seeding a draft from any prior answer or sensible default.
+    pub fn begin_edit(&mut self) {
+        let prior = match &self.state {
+            InputState::Answered { value } => Some(value.clone()),
+            _ => None,
+        };
+        let draft = match &self.config {
+            MagicInputBlock::Confirm { .. } => Draft::Confirm(prior.as_deref() == Some("yes")),
+            MagicInputBlock::Input { .. } => {
+                Draft::Text(TextDraft::seeded(prior.clone().unwrap_or_default()))
+            }
+            MagicInputBlock::Select { .. } => {
+                let idx = prior
+                    .as_deref()
+                    .and_then(|v| self.options().iter().position(|o| o == v))
+                    .unwrap_or(0);
+                Draft::Select(idx)
+            }
+        };
+        self.state = InputState::Editing { draft, prior };
+    }
+
+    /// Commit the current draft as the answer. No-op if not editing.
+    pub fn submit(&mut self) {
+        let value = match &self.state {
+            InputState::Editing { draft, .. } => match draft {
+                Draft::Confirm(b) => Some(if *b { "yes" } else { "no" }.to_string()),
+                Draft::Text(t) => Some(t.value.clone()),
+                Draft::Select(i) => Some(self.option_at(*i).unwrap_or_default().to_string()),
+            },
+            _ => None,
+        };
+        if let Some(value) = value {
+            self.state = InputState::Answered { value };
+        }
+    }
+
+    /// Cancel editing, restoring a prior answer if there was one.
+    pub fn cancel(&mut self) {
+        if let InputState::Editing { prior, .. } = &self.state {
+            self.state = match prior {
+                Some(value) => InputState::Answered {
+                    value: value.clone(),
+                },
+                None => InputState::Pending,
+            };
+        }
+    }
+
+    fn draft_mut(&mut self) -> Option<&mut Draft> {
+        match &mut self.state {
+            InputState::Editing { draft, .. } => Some(draft),
+            _ => None,
+        }
+    }
+
+    // --- confirm ---
+
+    pub fn toggle_confirm(&mut self) {
+        if let Some(Draft::Confirm(b)) = self.draft_mut() {
+            *b = !*b;
+        }
+    }
+
+    pub fn set_confirm(&mut self, yes: bool) {
+        if let Some(Draft::Confirm(b)) = self.draft_mut() {
+            *b = yes;
+        }
+    }
+
+    // --- select ---
+
+    pub fn select_move(&mut self, forward: bool) {
+        let n = self.options().len();
+        if n == 0 {
+            return;
+        }
+        if let Some(Draft::Select(i)) = self.draft_mut() {
+            *i = if forward {
+                (*i + 1).min(n - 1)
+            } else {
+                i.saturating_sub(1)
+            };
+        }
+    }
+
+    // --- text ---
+
+    fn text_mut(&mut self) -> Option<&mut TextDraft> {
+        match self.draft_mut() {
+            Some(Draft::Text(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        if let Some(t) = self.text_mut() {
+            t.insert(c);
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        if let Some(t) = self.text_mut() {
+            t.backspace();
+        }
+    }
+
+    pub fn delete(&mut self) {
+        if let Some(t) = self.text_mut() {
+            t.delete();
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        if let Some(t) = self.text_mut() {
+            t.left();
+        }
+    }
+
+    pub fn cursor_right(&mut self) {
+        if let Some(t) = self.text_mut() {
+            t.right();
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        if let Some(t) = self.text_mut() {
+            t.home();
+        }
+    }
+
+    pub fn cursor_end(&mut self) {
+        if let Some(t) = self.text_mut() {
+            t.end();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn confirm() -> InputCell {
+        InputCell::new(MagicInputBlock::Confirm {
+            prompt: "Proceed?".into(),
+            target: "OK".into(),
+        })
+    }
+
+    fn text() -> InputCell {
+        InputCell::new(MagicInputBlock::Input {
+            prompt: "Name?".into(),
+            target: "NAME".into(),
+        })
+    }
+
+    fn select() -> InputCell {
+        InputCell::new(MagicInputBlock::Select {
+            prompt: "Pick".into(),
+            target: "CHOICE".into(),
+            options: Some(vec!["a".into(), "b".into(), "c".into()]),
+            option_file: None,
+        })
+    }
+
+    #[test]
+    fn pending_has_no_resolution() {
+        assert!(confirm().resolved().is_none());
+    }
+
+    #[test]
+    fn confirm_submit_writes_yes_no() {
+        let mut c = confirm();
+        c.begin_edit();
+        // Default seed is No.
+        c.submit();
+        assert_eq!(c.resolved(), Some(("OK", "no")));
+
+        c.begin_edit();
+        c.set_confirm(true);
+        c.submit();
+        assert_eq!(c.resolved(), Some(("OK", "yes")));
+    }
+
+    #[test]
+    fn confirm_toggle_flips() {
+        let mut c = confirm();
+        c.begin_edit();
+        c.toggle_confirm();
+        c.submit();
+        assert_eq!(c.resolved(), Some(("OK", "yes")));
+    }
+
+    #[test]
+    fn text_edit_inserts_and_deletes() {
+        let mut c = text();
+        c.begin_edit();
+        for ch in "abc".chars() {
+            c.insert_char(ch);
+        }
+        c.cursor_left();
+        c.insert_char('X'); // ab[X]c
+        c.submit();
+        assert_eq!(c.resolved(), Some(("NAME", "abXc")));
+
+        c.begin_edit(); // re-edit seeds from prior answer, cursor at end
+        c.backspace();
+        c.submit();
+        assert_eq!(c.resolved(), Some(("NAME", "abX")));
+    }
+
+    #[test]
+    fn text_cursor_clamps() {
+        let mut t = TextDraft::default();
+        t.left(); // no panic at 0
+        t.insert('é'); // multi-byte
+        t.insert('x');
+        assert_eq!(t.cursor, 2);
+        t.home();
+        t.delete(); // removes 'é'
+        assert_eq!(t.value, "x");
+        assert_eq!(t.cursor, 0);
+    }
+
+    #[test]
+    fn select_moves_and_clamps() {
+        let mut c = select();
+        c.begin_edit();
+        c.select_move(false); // already at 0, stays
+        c.select_move(true); // -> 1
+        c.select_move(true); // -> 2
+        c.select_move(true); // clamps at 2
+        c.submit();
+        assert_eq!(c.resolved(), Some(("CHOICE", "c")));
+    }
+
+    #[test]
+    fn cancel_restores_prior_answer() {
+        let mut c = text();
+        c.begin_edit();
+        c.insert_char('z');
+        c.submit();
+        assert_eq!(c.resolved(), Some(("NAME", "z")));
+
+        c.begin_edit();
+        c.insert_char('!'); // editing "z!"
+        c.cancel(); // discard edit, restore "z"
+        assert_eq!(c.resolved(), Some(("NAME", "z")));
+        assert!(!c.is_editing());
+    }
+
+    #[test]
+    fn cancel_from_pending_returns_to_pending() {
+        let mut c = confirm();
+        c.begin_edit();
+        c.cancel();
+        assert!(matches!(c.state, InputState::Pending));
+    }
+
+    #[test]
+    fn select_re_edit_seeds_from_answer() {
+        let mut c = select();
+        c.begin_edit();
+        c.select_move(true); // -> "b"
+        c.submit();
+        assert_eq!(c.resolved(), Some(("CHOICE", "b")));
+
+        c.begin_edit(); // should seed index at "b" (1)
+        match &c.state {
+            InputState::Editing {
+                draft: Draft::Select(i),
+                ..
+            } => assert_eq!(*i, 1),
+            other => panic!("expected select draft, got {other:?}"),
+        }
+    }
+
+    // --- execution layer ---
+
+    #[test]
+    fn is_runnable_recognizes_shells_and_skip() {
+        let mk = |lang: &str, skip: Option<bool>| CodeBlock {
+            lang: lang.into(),
+            meta: CodeBlockMeta {
+                skip,
+                ..Default::default()
+            },
+            content: String::new(),
+            state: CodeBlockState::NotRun,
+        };
+        assert!(mk("sh", None).is_runnable());
+        assert!(mk("bash", None).is_runnable());
+        assert!(mk("zsh", Some(false)).is_runnable());
+        assert!(!mk("sh", Some(true)).is_runnable()); // opted out
+        assert!(!mk("python", None).is_runnable()); // unknown lang
+    }
+
+    #[test]
+    fn interpreter_defaults_and_remaps() {
+        let rb = Runbook::new(None::<&str>, "---\ntitle: t\n---\n\n```sh\n:\n```\n").unwrap();
+        assert_eq!(rb.interpreter_for("sh"), vec!["/usr/bin/env", "sh"]);
+
+        let doc = "---\ninterpreters:\n  sh:\n    path: /bin/zsh -f\n---\n\n```sh\n:\n```\n";
+        let rb = Runbook::new(None::<&str>, doc).unwrap();
+        assert_eq!(rb.interpreter_for("sh"), vec!["/bin/zsh", "-f"]);
+    }
+
+    #[test]
+    fn script_wraps_with_before_and_after_each() {
+        let doc = "---\nbefore_each: set -e\nafter_each: echo done\n---\n\n```sh\necho body\n```\n";
+        let rb = Runbook::new(None::<&str>, doc).unwrap();
+        let c = match &rb.blocks[0] {
+            BookBlock::Code(c) => c,
+            other => panic!("expected code, got {other:?}"),
+        };
+        assert_eq!(rb.script_for(c), "set -e\necho body\necho done");
+    }
+
+    #[test]
+    fn env_for_layers_frontmatter_then_preceding_inputs() {
+        let doc = "---\nenv:\n  BASE: x\n---\n\n\
+            ```json mrthn=input\n{\"type\":\"input\",\"prompt\":\"p\",\"target\":\"NAME\"}\n```\n\n\
+            ```sh\necho hi\n```\n";
+        let mut rb = Runbook::new(None::<&str>, doc).unwrap();
+
+        // Before answering: the sh cell (block 1) sees BASE but not NAME.
+        let env = rb.env_for(1);
+        assert_eq!(env.get("BASE").map(String::as_str), Some("x"));
+        assert!(!env.contains_key("NAME"));
+
+        // Answer the input cell (block 0).
+        let cell = rb.input_at_mut(0).unwrap();
+        cell.begin_edit();
+        cell.insert_char('z');
+        cell.submit();
+
+        // Now block 1 sees the answer; block 0 (the input itself) does not see
+        // its own forthcoming value (only *preceding* cells count).
+        let env = rb.env_for(1);
+        assert_eq!(env.get("NAME").map(String::as_str), Some("z"));
+        assert!(!rb.env_for(0).contains_key("NAME"));
+    }
+
+    #[test]
+    fn ensure_tmp_dir_is_created_and_injected() {
+        let mut rb = Runbook::new(None::<&str>, "---\ntitle: t\n---\n\n```sh\n:\n```\n").unwrap();
+        let dir = rb.ensure_tmp_dir().unwrap();
+        assert!(dir.is_dir());
+        // Idempotent: second call returns the same path.
+        assert_eq!(rb.ensure_tmp_dir().unwrap(), dir);
+        // And it shows up in the env map under TMP_DIR.
+        let env = rb.env_for(0);
+        assert_eq!(
+            env.get("TMP_DIR").map(String::as_str),
+            Some(dir.to_str().unwrap())
+        );
+    }
 }

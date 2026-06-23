@@ -35,11 +35,41 @@ under the name given by `target` (`CHOICE`), so every cell *after* this one can 
 }
 ```
 
+## Name the order
+
+A `text` cell collects free-form input. Whatever the user types is written to
+`target` (`LABEL`), so later cells can reference `$LABEL`.
+
+```json mrthn=input
+{
+  "type": "input",
+  "prompt": "Give this order a label:",
+  "target": "LABEL"
+}
+```
+
+## Confirm before acting
+
+A `confirm` cell is a yes/no gate. The answer (`yes`/`no`) lands in `target`
+(`PROCEED`), so a later cell can branch on it.
+
+```json mrthn=input
+{
+  "type": "confirm",
+  "prompt": "Submit the order now?",
+  "target": "PROCEED"
+}
+```
+
 ## Act on the choice
 
 ```sh
-echo "You picked: $CHOICE"
-curl -s -X POST "$BASE/api/order/$CHOICE"
+echo "You picked: $CHOICE (labeled '$LABEL')"
+if [ "$PROCEED" = "yes" ]; then
+  curl -s -X POST "$BASE/api/order/$CHOICE"
+else
+  echo "Skipped — PROCEED was '$PROCEED'."
+fi
 ```
 
 ---
