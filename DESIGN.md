@@ -5,7 +5,7 @@
 
 ## 1. What marathon is
 
-`marathon` (binary alias `mrthn`) is a CLI/TUI for viewing, validating, and
+`marathon` is a CLI/TUI for viewing, validating, and
 running markdown **runbooks** — markdown documents whose fenced code blocks can be
 executed in order.
 
@@ -56,8 +56,8 @@ More markdown text.
 
 ### Canonical naming
 
-- The special-block role key is **`mrthn`**: `` ```json mrthn=input ``. (Matches the
-  binary alias; leaves room for future roles like `mrthn=table`.)
+- The special-block role key is **`mrthn`**: `` ```json mrthn=input ``. (A short,
+  unobtrusive namespace that leaves room for future roles like `mrthn=table`.)
 - Ordinary per-cell options are bare keys: `skip=true`.
 
 ## 3. Cells and execution

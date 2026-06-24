@@ -23,9 +23,9 @@ Ask for a new name:
 ```json mrthn=input
 {
   "type": "select",
-  "prompt": "Which option do you want?",
+  "prompt": "Who are you?",
   "target": "NAME",
-  "options": ["foo","bar","baz"]
+  "options": ["Alice","Bob","Carol"]
 }
 ```
 

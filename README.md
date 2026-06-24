@@ -1,6 +1,8 @@
 # marathon
 
-`marathon` (or `mrthn`) is a CLI/TUI for viewing, managing, and running markdown runbooks.
+![Demo gif of the marathon tui](./demo.gif)
+
+`marathon` is a CLI/TUI for viewing, managing, and running markdown runbooks.
 
 Marathon's goal is to be as compatable as possible with other markdown tools.
 

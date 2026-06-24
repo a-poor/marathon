@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`marathon` (binary alias `mrthn`) is a CLI/TUI for viewing, managing, and running
+`marathon` is a CLI/TUI for viewing, managing, and running
 markdown **runbooks** — markdown documents whose fenced code blocks can be executed.
 A core design constraint is **maximum compatibility with other markdown tools**: a
 runbook must remain a valid, ordinary markdown file. Marathon-specific behavior is
