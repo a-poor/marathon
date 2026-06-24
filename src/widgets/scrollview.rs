@@ -183,9 +183,10 @@ impl StatefulWidget for DocumentView<'_> {
         let cache = state.cache.as_ref().expect("cache populated above");
         // A genuinely dark gray. `Color::DarkGray` is ANSI bright-black, which many
         // terminals render *light*; an indexed 256-color gives a real dark bar.
-        // While editing an input cell, tint the bar a dark blue to signal focus.
+        // While editing an input cell, tint the bar a soft, muted indigo to signal
+        // focus — a saturated palette blue (e.g. `Indexed(17)`) reads too harsh.
         let hl = if self.active {
-            Style::new().bg(Color::Indexed(17))
+            Style::new().bg(Color::Rgb(43, 47, 79))
         } else {
             Style::new().bg(Color::Indexed(237))
         };
@@ -228,26 +229,25 @@ fn build_document(book: &Runbook, width: u16) -> (Vec<Line<'static>>, Vec<Range<
     (lines, ranges)
 }
 
-/// Render a runnable code cell with a two-column left gutter instead of a raw
-/// markdown fence: a corner + language label header, the (char-wrapped) body each
-/// prefixed by a **heavy** bar tinted by run state, then the result section — the
-/// captured output and a trailing status line — on a **light dotted** bar. Heavy
-/// bar = source; dotted bar = result. The state tint (grey idle, yellow running,
-/// green ok, red error) makes a cell's run state legible at a glance.
+/// Render a code cell. A **runnable** cell (a recognized shell, not `skip`) gets the
+/// run gutter — a corner + language label, the body on a **heavy** bar tinted by run
+/// state, then the result section (output + status line) on a **light dotted** bar.
+/// A **display-only** cell (`skip=true`, or a non-shell language) never executes, so
+/// it renders as a plain code block instead (see [`display_code_lines`]).
 fn code_lines(c: &CodeBlock, width: usize) -> Vec<Line<'static>> {
+    if !c.is_runnable() {
+        return display_code_lines(c, width);
+    }
+
     let mut lines = Vec::new();
     let color = gutter_color(c.state);
 
-    // Header: a corner anchoring the gutter, the language label, and a `skip`
-    // badge for non-runnable cells. No backticks — the gutter conveys "code".
-    let mut head = vec![
+    // Header: a corner anchoring the gutter and the language label. No backticks —
+    // the gutter conveys "code".
+    let head = vec![
         Span::styled("┏ ", Style::new().fg(color)),
         c.lang.clone().cyan(),
     ];
-    if c.meta.skip.unwrap_or(false) {
-        head.push(Span::raw("  "));
-        head.push("skip".italic().yellow());
-    }
     lines.push(Line::from(head));
 
     // Body: each wrapped line carries the heavy bar; only the content is green so
@@ -265,6 +265,30 @@ fn code_lines(c: &CodeBlock, width: usize) -> Vec<Line<'static>> {
     // conclusion (so "running…" sits beneath the live output tail).
     lines.extend(output_lines(&c.output, width));
     lines.push(status_line(c));
+    lines
+}
+
+/// Render a display-only code block (`skip=true`, or a non-shell language) as an
+/// ordinary fenced code block: the same cyan language label and green body as a
+/// runnable cell, just indented two columns. No run gutter, status line, or "not
+/// run" footer — it never executes, so run chrome would only mislead.
+fn display_code_lines(c: &CodeBlock, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    // The language label (omitted for an unlabelled fence) sets the block apart from
+    // prose; the colors match a runnable cell so code reads consistently.
+    if !c.lang.is_empty() {
+        lines.push(Line::from(c.lang.clone().cyan()));
+    }
+
+    let avail = width.saturating_sub(2).max(1);
+    for line in c.content.lines() {
+        for chunk in hard_break(vec![Span::raw(line.to_string())], avail) {
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(chunk.into_iter().map(Stylize::green));
+            lines.push(Line::from(spans));
+        }
+    }
     lines
 }
 
@@ -726,8 +750,13 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
     }
 
     fn code_cell() -> CodeBlock {
-        let rb = Runbook::new(None::<&str>, "---\ntitle: t\n---\n\n```sh\necho hi\n```\n").unwrap();
-        rb.blocks
+        code_cell_from("---\ntitle: t\n---\n\n```sh\necho hi\n```\n")
+    }
+
+    fn code_cell_from(src: &str) -> CodeBlock {
+        Runbook::new(None::<&str>, src)
+            .unwrap()
+            .blocks
             .into_iter()
             .find_map(|b| match b {
                 BookBlock::Code(c) => Some(c),
@@ -754,6 +783,38 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
         let body = line_text(&lines[1]);
         assert!(body.contains('┃'), "code body lacks gutter bar: {body}");
         assert!(body.contains("echo"), "code body missing: {body}");
+    }
+
+    #[test]
+    fn display_only_code_has_no_gutter_or_status() {
+        // Both a `skip=true` shell block and a non-shell block are display-only.
+        for src in [
+            "---\ntitle: t\n---\n\n```sh skip=true\necho hi\n```\n",
+            "---\ntitle: t\n---\n\n```python\nprint(\"hi\")\n```\n",
+        ] {
+            let c = code_cell_from(src);
+            assert!(!c.is_runnable(), "expected display-only: {src}");
+
+            let joined = code_lines(&c, 40)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            // No run gutter glyphs, no status footer.
+            for g in ['┏', '┃', '┗', '┊'] {
+                assert!(!joined.contains(g), "run gutter leaked ({g}): {joined}");
+            }
+            assert!(
+                !joined.contains("not run"),
+                "display-only block should have no status line: {joined}"
+            );
+            // Still recognizable as a code block: a language label and the body.
+            assert!(
+                joined.contains("echo") || joined.contains("print"),
+                "body missing: {joined}"
+            );
+        }
     }
 
     #[test]
