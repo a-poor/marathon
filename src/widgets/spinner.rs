@@ -15,7 +15,10 @@ impl SpinnerWidget {
         }
     }
 
-    fn get(&self) -> char {
+    /// The braille frame for the current instant, or a space if no start time is
+    /// set. Public so the footer can embed the spinner inside its status badge
+    /// rather than rendering it as a standalone widget.
+    pub fn current(&self) -> char {
         let dur = if let Some(s) = self.start {
             s.elapsed()
         } else {
@@ -29,6 +32,6 @@ impl SpinnerWidget {
 
 impl Widget for SpinnerWidget {
     fn render(self, area: ratatui::prelude::Rect, buf: &mut ratatui::prelude::Buffer) {
-        Span::raw(format!("{}", self.get())).render(area, buf);
+        Span::raw(format!("{}", self.current())).render(area, buf);
     }
 }

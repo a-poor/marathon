@@ -25,31 +25,61 @@ runnable block, to make run state legible at a glance.
 
 - **Truncated by default** — show at most ~5–10 lines of a cell's output.
 - **Verbose toggle** — a key/mode to expand a cell's full output on demand.
-- **Run metadata on the cell** — show **elapsed run time** and **exit code**
-  once a cell finishes (alongside the existing status line).
+- ~~**Run metadata on the cell** — elapsed run time + exit code.~~ **Built.**
+  A finished cell's status line shows `✔ ok · 1.2s` (elapsed always) and appends
+  `· exit N` only when the process exited non-zero (`✗ error · 0.4s · exit 2`).
+  Timing lives on `CodeBlock` (`started_at`/`elapsed`), the exit code threads
+  through `RunMsg::Finished { code }`. A *live* ticking timer for a running cell is
+  deliberately the footer's job (it redraws every frame), not the cell's — updating
+  it in the cached doc would force a per-frame re-wrap.
 - Ties into the streaming/ANSI handling still under review in `DESIGN.md` §7.
 
 ## Notes
 
 - These are explicitly post-MVP polish.
-- **Cell execution: built (non-streaming).** Enter/`r` on a runnable shell cell
-  (`sh`/`bash`/`zsh`, not `skip=true`) runs it as its own process
-  (`runner::run_script`) off-thread; the result returns via a `RunMsg` channel
-  arm in the draw loop. The env map (`Runbook::env_for`) layers frontmatter `env`
-  → `TMP_DIR` → preceding answered input cells (DESIGN §4); `before_each`/
-  `after_each` and `interpreters.<lang>.path` remap are honored. `TMP_DIR` is a
-  real `mktemp` dir, cleaned on drop unless `skip_cleanup`. Combined stdout+stderr
-  is captured whole and shown under the cell, capped at `OUTPUT_MAX_LINES` (10).
+- **Cell execution + streaming: built.** Enter/`r` on a runnable shell cell
+  (`sh`/`bash`/`zsh`, not `skip=true`) runs it as its own process off-thread.
+  Output streams back line-by-line via `runner::run_streaming` over a `RunMsg`
+  channel arm in the draw loop (`Output` chunks then one `Finished`); each chunk
+  appends to `CodeBlock.output` and bumps `revision`. The env map
+  (`Runbook::env_for`) layers frontmatter `env` → `TMP_DIR` → preceding answered
+  input cells (DESIGN §4); `before_each`/`after_each` and `interpreters.<lang>.path`
+  remap are honored. `TMP_DIR` is a real `mktemp` dir, cleaned on drop unless
+  `skip_cleanup`. Output renders under the cell as the *tail* (last
+  `OUTPUT_MAX_LINES` = 10 lines, "… N earlier lines" marker above). Status
+  (`CodeBlockState`) and the output buffer are separate fields, per the three-tier
+  note. `runner::run_script` (collect-all) is kept for the non-TUI `exec` path.
   Still deferred:
-  - **Streaming output + ANSI** (DESIGN §7) — today output appears all at once
-    when the process exits. This is the thing that should *trigger the per-block
-    `DocLayout` refactor below*, since streaming re-wraps the whole flat doc.
+  - **ANSI / true stdout-stderr ordering** (DESIGN §7) — streams are merged by
+    arrival, not strictly ordered (needs a pty); ANSI escapes are passed through
+    raw, not interpreted.
   - **Animated spinner while running** — needs a draw-time overlay (the running
     status line is in the cached doc, so it can't animate without a per-frame
     `revision` bump). Lands with the overlay/`DocLayout` work.
-  - **Run metadata** — elapsed time + exit code on the cell (the `Success`/`Error`
-    state currently carries only the output string).
-  - **Verbose toggle** to expand past the 10-line output cap.
+  - ~~**Run metadata** — elapsed time + exit code on the cell.~~ **Built** — see
+    the "Code block output" section above.
+  - **Verbose toggle** to expand past the 10-line output tail.
+
+- **Footer / status bar: wired to real run state.** The bottom bar's badge now
+  reflects an aggregate derived fresh each frame from `Runbook::run_counts()`:
+  `running` (any cell executing) → `error` (any current failure) → `done` (any
+  success) → `ready`. The braille **spinner lives inside the badge**, left of the
+  text, and only animates while running; otherwise the badge shows a static
+  state glyph (`◦`/`✔`/`✗`). The middle shows mode-aware key hints (navigate vs.
+  edit); the right shows `N/M complete` run progress. The badge tracks run state
+  only — input-editing mode is conveyed by the cell highlight, not the footer.
+  Still to polish:
+  - **Tune the badge colors.** `fg` is currently black on every status; black-on-red
+    (error) reads muddy and black-on-blue (ready) is low-contrast on some themes.
+    Pick per-status fg/bg pairs with decent contrast (e.g. white-on-red for error),
+    ideally against both light and dark terminal backgrounds.
+
+  Note on the **`DocLayout` refactor below**: streaming did *not* require it. The
+  draw loop rebuilds the wrapped-line cache lazily — at most once per frame — so
+  many `Output` chunks between frames coalesce into a single whole-doc re-wrap at
+  30fps, not one per line. The refactor is now a **large-document** perf
+  optimization (and the enabler for the animated spinner overlay), not a
+  prerequisite for streaming.
 - **Input blocks: widget + state are built** (confirm / input / select, with an
   Enter-to-edit `Mode::Active` focus model and an answered `resolved() ->
   (target, value)` seam, now wired into `env_for`). Still deferred:
@@ -61,13 +91,17 @@ runnable block, to make run state legible at a glance.
 
 ## Decisions
 
-### Per-block layout model (deferred until execution/output blocks land)
+### Per-block layout model (deferred — now a large-doc perf optimization)
 
 Today the document is rendered as one flat `Vec<Line>` cached by `width +
 revision`, with a `ranges: Vec<Range<usize>>` sidecar mapping block → line span.
-Any content change bumps `revision` and re-wraps the *whole* document. That's
-fine for the read-only viewer and for input cells (tiny; per-keystroke full
-reflow is free), but too blunt once command output streams.
+Any content change bumps `revision` and re-wraps the *whole* document. This held
+up fine through execution + streaming output: because the cache rebuilds lazily
+(once per frame at most), a burst of streamed chunks coalesces into a single
+re-wrap per frame, not one per line. So the trigger for this refactor is no
+longer "streaming lands" — it's **a document large enough that one whole-doc
+re-wrap per frame is visibly costly**, or wanting the **draw-time overlay** that
+the animated running-spinner needs.
 
 **Decision:** when we build execution + output blocks, move to a retained
 per-block layout:

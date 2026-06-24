@@ -15,7 +15,7 @@ use crate::{
     book::{BookBlock, CodeBlockState, MagicInputBlock, Runbook},
     runner::{self, RunMsg},
     widgets::{
-        footer::FooterWidget,
+        footer::{FooterWidget, Status},
         scrollview::{DocumentView, ScrollState},
     },
 };
@@ -120,7 +120,32 @@ impl App {
             &mut self.scroll,
         );
 
-        frame.render_widget(FooterWidget::new(self.start), footer);
+        frame.render_widget(self.footer(), footer);
+    }
+
+    /// Build the footer for this frame: an aggregate run-state badge, mode-aware
+    /// key hints, and `N/M complete` progress, all derived fresh from the book.
+    fn footer(&self) -> FooterWidget<'static> {
+        let counts = self.book.run_counts();
+        let status = if counts.running > 0 {
+            Status::Running
+        } else if counts.errored > 0 {
+            Status::Error
+        } else if counts.succeeded > 0 {
+            Status::Done
+        } else {
+            Status::Ready
+        };
+
+        let hints = match self.mode {
+            Mode::Navigate => Line::from("j/k move · enter run · q quit"),
+            Mode::Active => Line::from("enter submit · esc cancel · ←/→ edit"),
+        };
+
+        FooterWidget::new(self.start)
+            .status(status)
+            .progress(counts.finished(), counts.runnable)
+            .hints(hints)
     }
 
     /// Translate a single terminal event into a state change. Infallible now;
@@ -206,50 +231,39 @@ impl App {
         };
 
         if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
-            c.state = CodeBlockState::Running;
+            c.begin_run();
         }
         self.book.last_run = Some(idx);
         self.revision += 1;
 
         let tx = self.run_tx.clone();
-        tokio::spawn(async move {
-            let msg = match runner::run_script(&interp, &script, &env).await {
-                Ok(r) => RunMsg::Done {
-                    idx,
-                    success: r.success,
-                    output: r.output,
-                },
-                Err(e) => RunMsg::Done {
-                    idx,
-                    success: false,
-                    output: format!("failed to run: {e}"),
-                },
-            };
-            let _ = tx.send(msg);
-        });
+        tokio::spawn(runner::run_streaming(idx, interp, script, env, tx));
     }
 
     fn set_cell_error(&mut self, idx: usize, msg: String) {
         if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
-            c.state = CodeBlockState::Error(msg);
+            c.output = msg;
+            c.state = CodeBlockState::Error;
         }
         self.revision += 1;
     }
 
-    /// Fold a finished run back into the document.
+    /// Fold a streamed run message back into the document.
     fn apply_run_msg(&mut self, msg: RunMsg) {
-        let RunMsg::Done {
-            idx,
-            success,
-            output,
-        } = msg;
-        if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
-            c.state = if success {
-                CodeBlockState::Success(output)
-            } else {
-                CodeBlockState::Error(output)
-            };
+        match msg {
+            RunMsg::Output { idx, chunk } => {
+                if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
+                    c.push_output(&chunk);
+                }
+            }
+            RunMsg::Finished { idx, success, code } => {
+                if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
+                    c.finish(success, code);
+                }
+            }
         }
+        // Either way the cell's rendered lines changed; invalidate the cache. The
+        // draw loop coalesces many of these into one re-wrap per frame.
         self.revision += 1;
     }
 

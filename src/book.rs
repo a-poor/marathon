@@ -199,6 +199,48 @@ impl Runbook {
 
         map
     }
+
+    /// Tally code-cell run states for the footer's aggregate badge + progress.
+    /// One pass over the blocks; only [`CodeBlock`]s contribute.
+    pub fn run_counts(&self) -> RunCounts {
+        let mut c = RunCounts::default();
+        for block in &self.blocks {
+            if let BookBlock::Code(cb) = block {
+                if cb.is_runnable() {
+                    c.runnable += 1;
+                }
+                match cb.state {
+                    CodeBlockState::Running => c.running += 1,
+                    CodeBlockState::Success => c.succeeded += 1,
+                    CodeBlockState::Error => c.errored += 1,
+                    CodeBlockState::NotRun => {}
+                }
+            }
+        }
+        c
+    }
+}
+
+/// Aggregate run state across all code cells, derived fresh each draw from the
+/// blocks' current [`CodeBlockState`]s (re-running a cell flips its state, so these
+/// reflect *now*, not history). Drives the footer badge and `N/M` progress.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RunCounts {
+    /// Cells currently executing.
+    pub running: usize,
+    /// Cells whose last run exited 0.
+    pub succeeded: usize,
+    /// Cells whose last run failed.
+    pub errored: usize,
+    /// Total cells marathon would execute (recognized shell, not `skip`).
+    pub runnable: usize,
+}
+
+impl RunCounts {
+    /// Cells that have finished a run (succeeded or errored) — the `N` in `N/M`.
+    pub fn finished(&self) -> usize {
+        self.succeeded + self.errored
+    }
 }
 
 #[derive(Debug)]
@@ -214,8 +256,21 @@ pub struct CodeBlock {
     pub lang: String,
     pub meta: CodeBlockMeta,
     pub content: String,
+    /// Lifecycle status of the cell (idle / running / ok / error).
     pub state: CodeBlockState,
-    // more state?
+    /// Combined stdout+stderr captured from the run, accumulated as it streams in.
+    /// Kept separate from `state` because it changes far more frequently (see the
+    /// three-tier note in TODO.md): a chunk appends here without touching `state`.
+    pub output: String,
+    /// When the current run began. Set in [`CodeBlock::begin_run`], used to compute
+    /// [`CodeBlock::elapsed`] on finish. A live ticking timer is the footer's job
+    /// (it redraws every frame); this only yields the final duration.
+    pub started_at: Option<std::time::Instant>,
+    /// Wall-clock duration of the last finished run, shown on the status line.
+    pub elapsed: Option<std::time::Duration>,
+    /// Exit code of the last finished run, if the process exited normally (`None`
+    /// if killed by a signal). Surfaced on the status line only when non-zero.
+    pub exit_code: Option<i32>,
 }
 
 impl CodeBlock {
@@ -223,6 +278,31 @@ impl CodeBlock {
     /// not opted out via `skip=true`. Unknown languages are display-only (MVP).
     pub fn is_runnable(&self) -> bool {
         !self.meta.skip.unwrap_or(false) && matches!(self.lang.as_str(), "sh" | "bash" | "zsh")
+    }
+
+    /// Reset for a fresh run: clear prior output, start the clock, mark it running.
+    pub fn begin_run(&mut self) {
+        self.output.clear();
+        self.started_at = Some(std::time::Instant::now());
+        self.elapsed = None;
+        self.exit_code = None;
+        self.state = CodeBlockState::Running;
+    }
+
+    /// Append a streamed output chunk.
+    pub fn push_output(&mut self, chunk: &str) {
+        self.output.push_str(chunk);
+    }
+
+    /// Mark the run finished, recording how long it ran and its exit code.
+    pub fn finish(&mut self, success: bool, code: Option<i32>) {
+        self.elapsed = self.started_at.map(|s| s.elapsed());
+        self.exit_code = code;
+        self.state = if success {
+            CodeBlockState::Success
+        } else {
+            CodeBlockState::Error
+        };
     }
 }
 
@@ -244,17 +324,23 @@ impl TryFrom<markdown::mdast::Code> for CodeBlock {
             content: val.value,
             meta,
             state: CodeBlockState::NotRun,
+            output: String::new(),
+            started_at: None,
+            elapsed: None,
+            exit_code: None,
         })
     }
 }
 
-#[derive(Debug, Default)]
+/// Lifecycle status of a runnable cell. The captured output lives separately on
+/// [`CodeBlock::output`], so a streamed chunk never has to reconstruct this.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum CodeBlockState {
     #[default]
     NotRun,
     Running,
-    Success(String),
-    Error(String),
+    Success,
+    Error,
 }
 
 /// The frontmatter from a runbook
@@ -866,12 +952,52 @@ mod tests {
             },
             content: String::new(),
             state: CodeBlockState::NotRun,
+            output: String::new(),
+            started_at: None,
+            elapsed: None,
+            exit_code: None,
         };
         assert!(mk("sh", None).is_runnable());
         assert!(mk("bash", None).is_runnable());
         assert!(mk("zsh", Some(false)).is_runnable());
         assert!(!mk("sh", Some(true)).is_runnable()); // opted out
         assert!(!mk("python", None).is_runnable()); // unknown lang
+    }
+
+    #[test]
+    fn run_counts_tally_runnable_and_states() {
+        // Two runnable shell cells and one display-only python cell.
+        let doc = "---\ntitle: t\n---\n\n```sh\necho a\n```\n\n\
+                   ```sh\necho b\n```\n\n```python\nprint(1)\n```\n";
+        let mut rb = Runbook::new(None::<&str>, doc).unwrap();
+        assert_eq!(
+            rb.run_counts(),
+            RunCounts {
+                runnable: 2,
+                ..Default::default()
+            }
+        );
+
+        // Drive the first shell cell to success, the second to error.
+        let mut seen = 0;
+        for block in rb.blocks.iter_mut() {
+            if let BookBlock::Code(c) = block
+                && c.lang == "sh"
+            {
+                c.state = if seen == 0 {
+                    CodeBlockState::Success
+                } else {
+                    CodeBlockState::Error
+                };
+                seen += 1;
+            }
+        }
+
+        let counts = rb.run_counts();
+        assert_eq!(counts.runnable, 2);
+        assert_eq!(counts.succeeded, 1);
+        assert_eq!(counts.errored, 1);
+        assert_eq!(counts.finished(), 2);
     }
 
     #[test]

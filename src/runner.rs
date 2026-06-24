@@ -13,8 +13,9 @@ use std::collections::HashMap;
 use std::process::Stdio;
 
 use anyhow::Result;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc::UnboundedSender;
 
 /// The outcome of running one cell.
 #[derive(Debug)]
@@ -28,11 +29,15 @@ pub struct RunResult {
 /// A message from a spawned cell run back to the UI loop.
 #[derive(Debug)]
 pub enum RunMsg {
-    /// A cell finished (successfully or not).
-    Done {
+    /// A line of output (stdout or stderr) streamed from a running cell. The chunk
+    /// already includes its trailing newline.
+    Output { idx: usize, chunk: String },
+    /// The cell's process exited. `code` is the exit status if it exited normally
+    /// (`None` if killed by a signal); surfaced on the cell when non-zero.
+    Finished {
         idx: usize,
         success: bool,
-        output: String,
+        code: Option<i32>,
     },
 }
 
@@ -84,6 +89,87 @@ pub async fn run_script(
     })
 }
 
+/// Run a cell and stream its output line-by-line back over `tx`: a [`RunMsg::Output`]
+/// per line (stdout and stderr merged), then exactly one [`RunMsg::Finished`]. This
+/// is the path the TUI uses so long-running cells reveal output as it arrives.
+///
+/// stdout/stderr are interleaved by arrival, not strictly ordered — true ordering
+/// needs a pty and is deferred (DESIGN §7).
+pub async fn run_streaming(
+    idx: usize,
+    interp: Vec<String>,
+    script: String,
+    env: HashMap<String, String>,
+    tx: UnboundedSender<RunMsg>,
+) {
+    match stream_inner(idx, &interp, &script, &env, &tx).await {
+        Ok((success, code)) => {
+            let _ = tx.send(RunMsg::Finished { idx, success, code });
+        }
+        Err(e) => {
+            let _ = tx.send(RunMsg::Output {
+                idx,
+                chunk: format!("failed to run: {e}\n"),
+            });
+            let _ = tx.send(RunMsg::Finished {
+                idx,
+                success: false,
+                code: None,
+            });
+        }
+    }
+}
+
+/// Spawn the process, pump output lines to `tx`, and return the success flag. Sends
+/// no `Finished` — the caller does, so spawn errors get a uniform path.
+async fn stream_inner(
+    idx: usize,
+    interp: &[String],
+    script: &str,
+    env: &HashMap<String, String>,
+    tx: &UnboundedSender<RunMsg>,
+) -> Result<(bool, Option<i32>)> {
+    let (program, args) = interp
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("empty interpreter"))?;
+
+    let mut child = Command::new(program)
+        .args(args)
+        .envs(env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    // Feed the script on a separate task (see `run_script`).
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let script = script.to_owned();
+    let writer = tokio::spawn(async move {
+        let _ = stdin.write_all(script.as_bytes()).await;
+    });
+
+    let mut out_lines = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
+    let mut err_lines = BufReader::new(child.stderr.take().expect("stderr piped")).lines();
+    let (mut out_done, mut err_done) = (false, false);
+
+    while !(out_done && err_done) {
+        tokio::select! {
+            r = out_lines.next_line(), if !out_done => match r {
+                Ok(Some(l)) => { let _ = tx.send(RunMsg::Output { idx, chunk: format!("{l}\n") }); }
+                _ => out_done = true,
+            },
+            r = err_lines.next_line(), if !err_done => match r {
+                Ok(Some(l)) => { let _ = tx.send(RunMsg::Output { idx, chunk: format!("{l}\n") }); }
+                _ => err_done = true,
+            },
+        }
+    }
+
+    let status = child.wait().await?;
+    let _ = writer.await;
+    Ok((status.success(), status.code()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +208,41 @@ mod tests {
             .unwrap();
         assert!(res.success);
         assert!(res.output.contains("oops"));
+    }
+
+    #[tokio::test]
+    async fn streams_each_line_then_finishes() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        run_streaming(7, sh(), "printf 'a\\nb\\nc\\n'".into(), HashMap::new(), tx).await;
+
+        let mut chunks = Vec::new();
+        let mut finished = None;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                RunMsg::Output { idx, chunk } => {
+                    assert_eq!(idx, 7);
+                    chunks.push(chunk);
+                }
+                RunMsg::Finished { idx, success, code } => {
+                    assert_eq!(idx, 7);
+                    finished = Some((success, code));
+                }
+            }
+        }
+        assert_eq!(chunks, vec!["a\n", "b\n", "c\n"]);
+        assert_eq!(finished, Some((true, Some(0))));
+    }
+
+    #[tokio::test]
+    async fn streaming_reports_failure() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        run_streaming(0, sh(), "exit 3".into(), HashMap::new(), tx).await;
+        let mut finished = None;
+        while let Ok(msg) = rx.try_recv() {
+            if let RunMsg::Finished { success, code, .. } = msg {
+                finished = Some((success, code));
+            }
+        }
+        assert_eq!(finished, Some((false, Some(3))));
     }
 }

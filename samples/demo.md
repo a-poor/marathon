@@ -64,3 +64,31 @@ for n in 1 2 3; do
 done
 echo "done"
 ```
+
+What about a really really long output?
+
+
+```sh
+for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  echo "step $n"
+done
+echo "done"
+```
+
+How was that?
+
+```sh
+echo one
+echo two >&2
+echo three
+echo four >&2
+echo five
+echo six >&2
+echo seven
+echo eight >&2
+echo nine
+echo ten >&2
+```
+
+...
+

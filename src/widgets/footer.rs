@@ -1,49 +1,102 @@
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Style};
-use ratatui::text::Span;
+use ratatui::style::{Color, Style, Stylize};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
 use crate::widgets::spinner::SpinnerWidget;
 
-#[derive(Debug, Default)]
-pub struct FooterWidget {
-    pub start: Option<std::time::Instant>,
-    pub status: Status,
+/// The bottom status bar: a run-state badge (left), context key hints (center),
+/// and `N/M complete` run progress (right).
+///
+/// The footer is rebuilt and redrawn every frame (unlike the cached document), so
+/// anything live — the spinner animation here — is free. The spinner lives *inside*
+/// the badge, to the left of the text, and only animates while a cell is running;
+/// otherwise the badge shows a static glyph for its state.
+pub struct FooterWidget<'a> {
+    start: Option<std::time::Instant>,
+    status: Status,
+    /// `(finished, runnable)` — rendered as `N/M complete`.
+    progress: (usize, usize),
+    /// Context-sensitive key hints for the current mode.
+    hints: Line<'a>,
 }
 
-impl FooterWidget {
+impl<'a> FooterWidget<'a> {
     pub fn new(start: std::time::Instant) -> Self {
         Self {
             start: Some(start),
-            ..Default::default()
+            status: Status::Ready,
+            progress: (0, 0),
+            hints: Line::default(),
+        }
+    }
+
+    pub fn status(mut self, status: Status) -> Self {
+        self.status = status;
+        self
+    }
+
+    pub fn progress(mut self, finished: usize, runnable: usize) -> Self {
+        self.progress = (finished, runnable);
+        self
+    }
+
+    pub fn hints(mut self, hints: Line<'a>) -> Self {
+        self.hints = hints;
+        self
+    }
+
+    /// The badge glyph: the live spinner frame while running, else a static glyph
+    /// for the state.
+    fn glyph(&self) -> char {
+        match self.status {
+            Status::Running => SpinnerWidget::new(self.start).current(),
+            Status::Ready => '◦',
+            Status::Done => '✔',
+            Status::Error => '✗',
         }
     }
 }
 
-impl Widget for FooterWidget {
+impl Widget for FooterWidget<'_> {
     fn render(self, area: ratatui::prelude::Rect, buf: &mut ratatui::prelude::Buffer) {
-        let [status, _rest, spin] =
-            Layout::horizontal([Constraint::Max(9), Constraint::Min(0), Constraint::Min(1)])
-                .areas(area);
-
-        // Render the rest of the bar as blank
+        // Blank the whole bar first.
         buf.set_style(area, Style::new().bg(Color::Black));
 
-        // Render the status badge
+        let badge_text = format!(" {} {} ", self.glyph(), self.status.as_str());
+        let badge_w = badge_text.chars().count() as u16;
+
+        let (finished, runnable) = self.progress;
+        let prog_text = if runnable > 0 {
+            format!("{finished}/{runnable} complete ")
+        } else {
+            String::new()
+        };
+        let prog_w = prog_text.chars().count() as u16;
+
+        let [badge, mid, right] = Layout::horizontal([
+            Constraint::Length(badge_w),
+            Constraint::Min(0),
+            Constraint::Length(prog_w),
+        ])
+        .areas(area);
+
         Span::styled(
-            format!(" {} ", self.status.as_str()), // 1 space L + 1 space R, both colored
+            badge_text,
             Style::new()
                 .bold()
                 .fg(self.status.fg())
                 .bg(self.status.bg()),
         )
-        .render(status, buf);
+        .render(badge, buf);
 
-        SpinnerWidget::new(self.start).render(spin, buf);
+        // Hints centered in the open middle; progress right-aligned.
+        self.hints.centered().dim().render(mid, buf);
+        Line::from(prog_text).dim().render(right, buf);
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     #[default]
     Ready,
@@ -63,12 +116,7 @@ impl Status {
     }
 
     fn fg(&self) -> Color {
-        match self {
-            Status::Ready => Color::Black,
-            Status::Running => Color::Black,
-            Status::Done => Color::Black,
-            Status::Error => Color::Black,
-        }
+        Color::Black
     }
 
     fn bg(&self) -> Color {
