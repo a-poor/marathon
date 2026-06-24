@@ -17,7 +17,9 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::StatefulWidget;
 
-use crate::book::{BookBlock, CodeBlock, CodeBlockState, Draft, InputCell, InputState, Runbook};
+use crate::book::{
+    BookBlock, Cancel, CodeBlock, CodeBlockState, Draft, InputCell, InputState, Runbook,
+};
 use crate::widgets::markdown::render_md;
 use crate::widgets::wrap::{hard_break, wrap};
 
@@ -72,6 +74,13 @@ impl ScrollState {
         self.selected = len.saturating_sub(1);
     }
 
+    /// Jump the selection to a specific block index, clamped to content.
+    pub fn select_index(&mut self, idx: usize, len: usize) {
+        if len > 0 {
+            self.selected = idx.min(len - 1);
+        }
+    }
+
     /// Free line scroll (e.g. mouse wheel). Clamped to content at draw time.
     pub fn scroll_down(&mut self, n: u16) {
         self.offset = self.offset.saturating_add(n);
@@ -81,13 +90,13 @@ impl ScrollState {
         self.offset = self.offset.saturating_sub(n);
     }
 
-    fn ensure_cache(&mut self, book: &Runbook, width: u16, revision: u64) {
+    fn ensure_cache(&mut self, book: &Runbook, width: u16, revision: u64, verbose: bool) {
         let stale = match &self.cache {
             Some(c) => c.width != width || c.revision != revision,
             None => true,
         };
         if stale {
-            let (lines, ranges) = build_document(book, width);
+            let (lines, ranges) = build_document(book, width, verbose);
             self.cache = Some(Cache {
                 width,
                 revision,
@@ -104,6 +113,8 @@ pub struct DocumentView<'a> {
     revision: u64,
     /// Whether an input cell is being actively edited — tints the highlight bar.
     active: bool,
+    /// When set, cell outputs render in full instead of the truncated tail.
+    verbose: bool,
 }
 
 impl<'a> DocumentView<'a> {
@@ -112,12 +123,19 @@ impl<'a> DocumentView<'a> {
             book,
             revision,
             active: false,
+            verbose: false,
         }
     }
 
     /// Mark that the selected cell is being edited (changes the highlight tint).
     pub fn active(mut self, active: bool) -> Self {
         self.active = active;
+        self
+    }
+
+    /// Expand cell outputs to their full length (vs. the default truncated tail).
+    pub fn verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
         self
     }
 }
@@ -129,7 +147,7 @@ impl StatefulWidget for DocumentView<'_> {
         if area.is_empty() {
             return;
         }
-        state.ensure_cache(self.book, area.width, self.revision);
+        state.ensure_cache(self.book, area.width, self.revision, self.verbose);
 
         let h = area.height as usize;
         let (total, range, selected) = {
@@ -146,8 +164,9 @@ impl StatefulWidget for DocumentView<'_> {
         // grows by its own output — never by a block above shifting it down. We key
         // on last-run rather than "still running" so a fast command that finishes
         // between frames (its last output + the finish landing together) is still
-        // followed all the way to its tail.
-        let following_run = self.book.last_run == Some(selected);
+        // followed all the way to its tail. (Selection index 0 is the header, so a
+        // block's index `b` sits at selection `b + 1`.)
+        let following_run = self.book.last_run.map(|b| b + 1) == Some(selected);
 
         let changed = state.last_selected != Some(selected);
         let mut off = state.offset as usize;
@@ -178,8 +197,9 @@ impl StatefulWidget for DocumentView<'_> {
         state.last_selected = Some(selected);
         state.last_selected_end = Some(range.end);
 
-        // Draw the visible window line-by-line, painting a full-width highlight
-        // bar over rows belonging to the selected block.
+        // Draw the visible window line-by-line. The selected block gets a full-width
+        // highlight bar — except the header (block 0), whose selection is shown by
+        // recoloring its box border blue instead.
         let cache = state.cache.as_ref().expect("cache populated above");
         // A genuinely dark gray. `Color::DarkGray` is ANSI bright-black, which many
         // terminals render *light*; an indexed 256-color gives a real dark bar.
@@ -190,6 +210,8 @@ impl StatefulWidget for DocumentView<'_> {
         } else {
             Style::new().bg(Color::Indexed(237))
         };
+        let is_header = selected == 0;
+        let blue = Style::new().fg(Color::Blue);
         for i in 0..h {
             let idx = off + i;
             if idx >= total {
@@ -197,7 +219,21 @@ impl StatefulWidget for DocumentView<'_> {
             }
             let y = area.y + i as u16;
             buf.set_line(area.x, y, &cache.lines[idx], area.width);
-            if range.contains(&idx) {
+            if !range.contains(&idx) {
+                continue;
+            }
+            if is_header {
+                // Recolor the box border blue (top/bottom edges full-width; the side
+                // edges are just the first and last columns).
+                if idx == range.start || idx + 1 == range.end {
+                    buf.set_style(Rect::new(area.x, y, area.width, 1), blue);
+                } else {
+                    buf.set_style(Rect::new(area.x, y, 1, 1), blue);
+                    if area.width > 0 {
+                        buf.set_style(Rect::new(area.x + area.width - 1, y, 1, 1), blue);
+                    }
+                }
+            } else {
                 buf.set_style(Rect::new(area.x, y, area.width, 1), hl);
             }
         }
@@ -207,16 +243,28 @@ impl StatefulWidget for DocumentView<'_> {
 /// Flatten every block into wrapped lines plus a block→line-range map. A blank
 /// spacer line is emitted between blocks but kept *outside* the range, so cells
 /// breathe and the highlight bar stops at the content.
-fn build_document(book: &Runbook, width: u16) -> (Vec<Line<'static>>, Vec<Range<usize>>) {
+fn build_document(
+    book: &Runbook,
+    width: u16,
+    verbose: bool,
+) -> (Vec<Line<'static>>, Vec<Range<usize>>) {
     let w = width as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut ranges: Vec<Range<usize>> = Vec::new();
+
+    // The runbook header banner is selectable block index 0 (so you can scroll all
+    // the way back up to it). It scrolls with the document — not sticky. Its range
+    // covers the box; the trailing spacer sits outside, like the cells below.
+    let header = header_lines(book, w);
+    lines.extend(header);
+    ranges.push(0..lines.len());
+    lines.push(Line::default());
 
     for block in &book.blocks {
         let start = lines.len();
         match block {
             BookBlock::Md(node) => lines.extend(render_md(node, w)),
-            BookBlock::Code(c) => lines.extend(code_lines(c, w)),
+            BookBlock::Code(c) => lines.extend(code_lines(c, w, verbose)),
             BookBlock::Input(i) => lines.extend(input_lines(i, w)),
         }
         // The block's selectable/highlighted range is its content only; the
@@ -229,12 +277,240 @@ fn build_document(book: &Runbook, width: u16) -> (Vec<Line<'static>>, Vec<Range<
     (lines, ranges)
 }
 
+/// The idle border color — a quiet gray (matching the un-run gutter). When the header
+/// is selected, the draw loop overpaints the box border [`Color::Blue`] instead.
+const HEADER_BORDER: Color = Color::Indexed(240);
+
+/// The runbook header banner: a full box (border all around, `marathon` in the top
+/// edge) framing the runner ASCII art on the left and, on the right, the `marathon`
+/// wordmark stacked above the title / path / description / env fields. Selectable
+/// block 0; scrolls with the document.
+fn header_lines(book: &Runbook, width: usize) -> Vec<Line<'static>> {
+    let art = runner_art();
+    let art_w = art.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+
+    // Right column: the big wordmark, a blank line, then the frontmatter fields.
+    let wordmark = wordmark_lines();
+    let wordmark_w = wordmark.iter().map(Line::width).max().unwrap_or(0);
+    let mut right = wordmark;
+    right.push(Line::default());
+    right.extend(header_fields(book));
+
+    // Drop the runner on narrow terminals so it can't crowd out the wordmark: it's
+    // shown only when the box has room for both (plus borders, the column gap, and a
+    // small margin). Below that, just the wordmark + fields.
+    let show_art = width >= art_w + wordmark_w + 7;
+    let gap = if show_art { 3 } else { 0 };
+
+    let border = Style::new().fg(HEADER_BORDER);
+    let mut lines = vec![box_top("marathon", width, border)];
+
+    let rows = if show_art {
+        art.len().max(right.len())
+    } else {
+        right.len()
+    };
+    for i in 0..rows {
+        // Left border, the (optional) art column padded to its width and a gap, then
+        // the right column (wordmark / fields).
+        let mut inner = vec![Span::styled("│", border), Span::raw(" ")];
+        if show_art {
+            inner.push(Span::styled(
+                format!("{:<art_w$}", art.get(i).map(String::as_str).unwrap_or("")),
+                Style::new().fg(Color::Cyan),
+            ));
+            inner.push(Span::raw(" ".repeat(gap)));
+        }
+        if let Some(line) = right.get(i) {
+            inner.extend(line.spans.iter().cloned());
+        }
+        // Fit the inner content to width-1 columns, then cap with the right border.
+        let mut spans = fit_to(inner, width.saturating_sub(1));
+        spans.push(Span::styled("│", border));
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(box_bottom(width, border));
+    lines
+}
+
+/// The title / path / description / env field lines (no box), each optional field
+/// shown only when present.
+fn header_fields(book: &Runbook) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut field = |label: &str, value: &str| {
+        lines.push(Line::from(vec![
+            format!("{label}: ").bold(),
+            Span::raw(value.to_string()),
+        ]));
+    };
+
+    if let Some(title) = book.frontmatter.title.as_deref().filter(|s| !s.is_empty()) {
+        field("Title", title);
+    }
+    if let Some(path) = book.path.as_ref().and_then(|p| p.to_str()) {
+        field("Path", path);
+    }
+    if let Some(desc) = book
+        .frontmatter
+        .description
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        field("Desc", desc);
+    }
+
+    let env = book.base_env();
+    let tmp = book.tmp_dir_env();
+    if !env.is_empty() || tmp.is_some() {
+        lines.push(Line::from("Env:".bold()));
+        for (k, v) in &env {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                format!("{k}: ").cyan(),
+                Span::raw(v.clone()),
+            ]));
+        }
+        // The temp-dir var is created lazily (after the first run), so it's listed
+        // here only once it exists — separately from `base_env`, which excludes it.
+        if let Some((k, v)) = tmp {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                format!("{k}: ").cyan(),
+                Span::raw(v),
+            ]));
+        }
+    }
+    lines
+}
+
+/// Top box edge with a label embedded near the left: `┌─ marathon ─────────┐`.
+fn box_top(label: &str, width: usize, border: Style) -> Line<'static> {
+    let head = format!("┌─ {label} ");
+    let used = head.chars().count();
+    let trail = width.saturating_sub(used + 1); // +1 for the closing corner
+    Line::from(vec![
+        Span::styled(head, border),
+        Span::styled("─".repeat(trail), border),
+        Span::styled("┐", border),
+    ])
+}
+
+/// Bottom box edge: `└──────────────────┘`.
+fn box_bottom(width: usize, border: Style) -> Line<'static> {
+    let mid = "─".repeat(width.saturating_sub(2));
+    Line::from(Span::styled(format!("└{mid}┘"), border))
+}
+
+/// Truncate or pad a row of spans to exactly `n` display columns (ASCII/box glyphs
+/// are width 1), so each boxed line lands its right border in the same column.
+fn fit_to(spans: Vec<Span<'static>>, n: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for s in spans {
+        if used >= n {
+            break;
+        }
+        let w = s.content.chars().count();
+        if used + w <= n {
+            used += w;
+            out.push(s);
+        } else {
+            let take = n - used;
+            let truncated: String = s.content.chars().take(take).collect();
+            out.push(Span::styled(truncated, s.style));
+            used = n;
+        }
+    }
+    if used < n {
+        out.push(Span::raw(" ".repeat(n - used)));
+    }
+    out
+}
+
+/// The big `marathon` wordmark for the header (block-glyph art), styled bold. Leading
+/// whitespace is preserved (it shapes the glyphs); only blank edge lines are trimmed.
+fn wordmark_lines() -> Vec<Line<'static>> {
+    const TEXT: &str = r#"
+                         ▗▖
+                     ▐▌  ▐▌
+▐█▙█▖ ▟██▖ █▟█▌ ▟██▖▐███ ▐▙██▖ ▟█▙ ▐▙██▖
+▐▌█▐▌ ▘▄▟▌ █▘   ▘▄▟▌ ▐▌  ▐▛ ▐▌▐▛ ▜▌▐▛ ▐▌
+▐▌█▐▌▗█▀▜▌ █   ▗█▀▜▌ ▐▌  ▐▌ ▐▌▐▌ ▐▌▐▌ ▐▌
+▐▌█▐▌▐▙▄█▌ █   ▐▙▄█▌ ▐▙▄ ▐▌ ▐▌▝█▄█▘▐▌ ▐▌
+▝▘▀▝▘ ▀▀▝▘ ▀    ▀▀▝▘  ▀▀ ▝▘ ▝▘ ▝▀▘ ▝▘ ▝▘
+"#;
+    let raw: Vec<&str> = TEXT.lines().collect();
+    let start = raw.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
+    let end = raw
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    raw[start..end]
+        .iter()
+        .map(|l| Line::from(l.trim_end().to_string().bold()))
+        .collect()
+}
+
+/// The runner ASCII art for the header, with surrounding blank lines stripped and the
+/// common left indent removed.
+fn runner_art() -> Vec<String> {
+    const ART: &str = r#"
+                        kfv,
+                       c'>C|8
+                       p0&C;\
+                      }hndkM
+                 j>{]MX@!wL8W
+              fY]iCmjWCiZ[1*I
+             Xkv   CW'Mxo[^t
+             t&>   !v}j*X<M;<]O@)&
+             +^    .i>Yn%b'0~},_
+             Ud   }+Wa:~b
+             1jb ~mCBlU&1
+                 [Iz^]uzh
+                 Z(}l+8#mqZ
+      ,I8        +X'u]~Xn"_C
+    {j~`f~_ai    \~ZWI`>Uj~X{
+         QC;t^adcI]`@O  n&;Cp(8
+             qaqJm{#       C`mB
+                 c+        *+Cf
+                           vBzt/
+                             [r)
+                              .!~
+                              "Yok,
+                               C]koM<
+"#;
+    let raw: Vec<&str> = ART.lines().collect();
+    // Trim fully-blank leading/trailing lines.
+    let start = raw.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
+    let end = raw
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let body = &raw[start..end];
+    // Remove the common left indent.
+    let indent = body
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    body.iter()
+        .map(|l| {
+            let dedented = if l.len() >= indent { &l[indent..] } else { l };
+            dedented.trim_end().to_string()
+        })
+        .collect()
+}
+
 /// Render a code cell. A **runnable** cell (a recognized shell, not `skip`) gets the
 /// run gutter — a corner + language label, the body on a **heavy** bar tinted by run
 /// state, then the result section (output + status line) on a **light dotted** bar.
 /// A **display-only** cell (`skip=true`, or a non-shell language) never executes, so
 /// it renders as a plain code block instead (see [`display_code_lines`]).
-fn code_lines(c: &CodeBlock, width: usize) -> Vec<Line<'static>> {
+fn code_lines(c: &CodeBlock, width: usize, verbose: bool) -> Vec<Line<'static>> {
     if !c.is_runnable() {
         return display_code_lines(c, width);
     }
@@ -263,7 +539,7 @@ fn code_lines(c: &CodeBlock, width: usize) -> Vec<Line<'static>> {
 
     // Result section: streamed output, then the status line as the run's
     // conclusion (so "running…" sits beneath the live output tail).
-    lines.extend(output_lines(&c.output, width));
+    lines.extend(output_lines(&c.output, width, verbose));
     lines.push(status_line(c));
     lines
 }
@@ -309,15 +585,28 @@ const OUTPUT_MAX_LINES: usize = 25;
 
 /// Render a cell's captured output on the light dotted "result" gutter, dimmed.
 /// Shows the *tail* (last [`OUTPUT_MAX_LINES`] lines) so a streaming run reveals its
-/// latest output, with a "… N earlier lines" marker when there's more above.
-fn output_lines(output: &str, width: usize) -> Vec<Line<'static>> {
+/// latest output, with a "… N earlier lines" marker when there's more above. When
+/// `verbose` (Ctrl+O), the full output is shown with no truncation or marker.
+fn output_lines(output: &str, width: usize, verbose: bool) -> Vec<Line<'static>> {
     if output.trim().is_empty() {
         return Vec::new();
     }
 
+    // Sanitize at the TUI boundary: strip ANSI/control bytes ratatui would render
+    // literally and corrupt the display with (DESIGN §7). Output that was *only*
+    // escapes is now empty.
+    let clean = crate::ansi::sanitize(output);
+    if clean.trim().is_empty() {
+        return Vec::new();
+    }
+
     let avail = width.saturating_sub(2).max(1);
-    let all: Vec<&str> = output.lines().collect();
-    let hidden = all.len().saturating_sub(OUTPUT_MAX_LINES);
+    let all: Vec<&str> = clean.lines().collect();
+    let hidden = if verbose {
+        0
+    } else {
+        all.len().saturating_sub(OUTPUT_MAX_LINES)
+    };
 
     // A neutral dim bar — output is data, not a verdict, so it stays uncolored
     // (the status line below carries the run-state tint).
@@ -470,13 +759,28 @@ fn text_field_line(value: &str, cursor: Option<usize>) -> Line<'static> {
 /// closing bracket rather than another output row. Once finished, the cell's elapsed
 /// run time is appended (`✔ ok · 1.2s`); the live timer while *running* is the
 /// footer's job, since updating it here would force a per-frame re-wrap of the document.
+///
+/// A pending cancellation re-labels the line: while running it reads "canceling…" /
+/// "killing…"; once the interrupted run finishes it reads "canceled" / "killed".
 fn status_line(c: &CodeBlock) -> Line<'static> {
     let bar = Span::styled("┗ ", Style::new().fg(gutter_color(c.state)));
-    match c.state {
-        CodeBlockState::NotRun => Line::from(vec![bar, "◦ not run".dim()]),
-        CodeBlockState::Running => Line::from(vec![bar, "● running…".yellow()]),
-        CodeBlockState::Success => finished_line(bar, "✔ ok".green(), c.elapsed, c.exit_code),
-        CodeBlockState::Error => finished_line(bar, "✗ error".red(), c.elapsed, c.exit_code),
+    match (c.state, c.cancel) {
+        (CodeBlockState::NotRun, _) => Line::from(vec![bar, "◦ not run".dim()]),
+        (CodeBlockState::Running, Cancel::None) => Line::from(vec![bar, "● running…".yellow()]),
+        (CodeBlockState::Running, Cancel::Interrupting) => {
+            Line::from(vec![bar, "● canceling…".yellow()])
+        }
+        (CodeBlockState::Running, Cancel::Killing) => Line::from(vec![bar, "● killing…".red()]),
+        (CodeBlockState::Success, _) => finished_line(bar, "✔ ok".green(), c.elapsed, c.exit_code),
+        (CodeBlockState::Error, Cancel::Interrupting) => {
+            finished_line(bar, "✗ canceled".red(), c.elapsed, c.exit_code)
+        }
+        (CodeBlockState::Error, Cancel::Killing) => {
+            finished_line(bar, "✗ killed".red(), c.elapsed, c.exit_code)
+        }
+        (CodeBlockState::Error, Cancel::None) => {
+            finished_line(bar, "✗ error".red(), c.elapsed, c.exit_code)
+        }
     }
 }
 
@@ -536,7 +840,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
     #[test]
     fn every_line_fits_the_width() {
         let book = book();
-        let (lines, _) = build_document(&book, 20);
+        let (lines, _) = build_document(&book, 20, false);
         for l in &lines {
             assert!(
                 display_width(&line_text(l)) <= 20,
@@ -547,19 +851,111 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
     }
 
     #[test]
+    fn header_shows_frontmatter_fields() {
+        let doc = "---\ntitle: My Run\ndescription: does things\nenv:\n  FOO: bar\n  BAZ: qux\n---\n\n# Hi\n";
+        let book = Runbook::new(Some("book.md"), doc).unwrap();
+        let lines = header_lines(&book, 60);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        let joined = text.join("\n");
+
+        assert!(joined.contains("marathon"), "missing top rule label");
+        assert!(joined.contains("Title: My Run"), "missing title");
+        assert!(joined.contains("Path: book.md"), "missing path");
+        assert!(joined.contains("Desc: does things"), "missing description");
+        // Env keys are listed, sorted.
+        let baz = text.iter().position(|l| l.contains("BAZ: qux")).unwrap();
+        let foo = text.iter().position(|l| l.contains("FOO: bar")).unwrap();
+        assert!(baz < foo, "env should be sorted by key");
+    }
+
+    #[test]
+    fn header_shows_temp_dir_once_created() {
+        let mut book =
+            Runbook::new(Some("book.md"), "---\ntitle: T\n---\n\n```sh\n:\n```\n").unwrap();
+        // `header_fields` is the un-truncated source; the box layout fits it to width.
+        let join = |b: &Runbook| {
+            header_fields(b)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // Before any run the dir doesn't exist, so it isn't listed.
+        assert!(!join(&book).contains("TMP_DIR"), "temp dir shown too early");
+
+        // Once created (as a run would), it appears under the Env section.
+        let dir = book.ensure_tmp_dir().unwrap();
+        let shown = join(&book);
+        assert!(shown.contains("Env:"), "env section missing: {shown}");
+        assert!(
+            shown.contains(&format!("TMP_DIR: {}", dir.display())),
+            "temp dir path missing: {shown}"
+        );
+    }
+
+    #[test]
+    fn header_hides_runner_on_narrow_terminals() {
+        let book = Runbook::new(Some("book.md"), "---\ntitle: T\n---\n\n# Hi\n").unwrap();
+        let join = |w| {
+            header_lines(&book, w)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // '@' is a distinctive runner glyph, absent from the wordmark and fields.
+        assert!(
+            join(100).contains('@'),
+            "runner should show on a wide terminal"
+        );
+
+        let narrow = join(50);
+        assert!(
+            !narrow.contains('@'),
+            "runner should be hidden when narrow: {narrow}"
+        );
+        assert!(
+            narrow.contains("Title: T"),
+            "title should remain when narrow"
+        );
+        assert!(narrow.contains("marathon"), "wordmark label should remain");
+    }
+
+    #[test]
+    fn header_omits_absent_optional_fields() {
+        // Minimal frontmatter: no title/description, empty env, and no path.
+        let book = Runbook::new(None::<&str>, "---\nenv: {}\n---\n\n# Just a heading\n").unwrap();
+        let joined = header_lines(&book, 40)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !joined.contains("Title:"),
+            "title should be omitted: {joined}"
+        );
+        assert!(
+            !joined.contains("Path:"),
+            "path should be omitted: {joined}"
+        );
+        assert!(!joined.contains("Env:"), "env should be omitted: {joined}");
+    }
+
+    #[test]
     fn long_content_wraps_to_multiple_lines() {
         let book = book();
-        let (lines, ranges) = build_document(&book, 20);
-        // 3 blocks (heading, paragraph, code) but many more lines once wrapped.
-        assert_eq!(ranges.len(), 3);
+        let (lines, ranges) = build_document(&book, 20, false);
+        // The header (range 0) plus 3 blocks (heading, paragraph, code).
+        assert_eq!(ranges.len(), 4);
         assert!(
             lines.len() > ranges.len() * 2,
             "expected wrapping to expand the document, got {} lines",
             lines.len()
         );
-        // First range starts at the top; the last ends just before the trailing
-        // spacer line (spacers live outside the highlighted ranges).
-        assert_eq!(ranges[0].start, 0);
+        // The header range starts at the very top; the first *block* follows it; the
+        // last range ends just before the trailing spacer (spacers live outside ranges).
+        assert_eq!(ranges[0].start, 0, "header is the first selectable range");
+        assert!(ranges[1].start > 0, "first block follows the header");
         assert_eq!(ranges.last().unwrap().end, lines.len() - 1);
     }
 
@@ -592,11 +988,12 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
 
         let mut term = Terminal::new(TestBackend::new(24, 6)).unwrap();
         let mut state = ScrollState::new();
+        state.select_index(1, 2); // select the cell (index 0 is the header)
 
-        // Frame 1: cell fits; its bottom is on screen.
+        // Frame 1: the (short) cell and its bottom are on screen.
         term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 0), f.area(), &mut state))
             .unwrap();
-        assert_eq!(state.offset, 0, "short cell should not scroll");
+        let first = state.offset;
 
         // Stream more output than the viewport is tall, then redraw.
         let BookBlock::Code(c) = &mut book.blocks[0] else {
@@ -608,8 +1005,11 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
         term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 1), f.area(), &mut state))
             .unwrap();
 
-        // The view followed the tail: it scrolled, and the newest line is visible.
-        assert!(state.offset > 0, "view should follow the growing output");
+        // The view followed the tail: it scrolled further, and the newest line shows.
+        assert!(
+            state.offset > first,
+            "view should follow the growing output"
+        );
         let dump = format!("{:?}", term.backend().buffer());
         assert!(
             dump.contains("line 29"),
@@ -627,6 +1027,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
 
         let mut term = Terminal::new(TestBackend::new(24, 6)).unwrap();
         let mut state = ScrollState::new();
+        state.select_index(1, 2); // select the cell (index 0 is the header)
         // Frame 1: idle cell, nothing scrolled.
         term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 0), f.area(), &mut state))
             .unwrap();
@@ -669,6 +1070,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
 
         let mut term = Terminal::new(TestBackend::new(24, 6)).unwrap();
         let mut state = ScrollState::new();
+        state.select_index(1, 2); // select the cell (index 0 is the header)
         term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 0), f.area(), &mut state))
             .unwrap();
 
@@ -768,7 +1170,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
     #[test]
     fn code_chrome_uses_gutter_not_backticks() {
         let c = code_cell();
-        let lines = code_lines(&c, 40);
+        let lines = code_lines(&c, 40, false);
 
         // Header carries the language label and a gutter corner, no raw fence.
         let head = line_text(&lines[0]);
@@ -795,7 +1197,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
             let c = code_cell_from(src);
             assert!(!c.is_runnable(), "expected display-only: {src}");
 
-            let joined = code_lines(&c, 40)
+            let joined = code_lines(&c, 40, false)
                 .iter()
                 .map(line_text)
                 .collect::<Vec<_>>()
@@ -819,10 +1221,40 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
 
     #[test]
     fn output_rides_the_dotted_gutter() {
-        let lines = output_lines("hello world\n", 40);
+        let lines = output_lines("hello world\n", 40, false);
         let only = line_text(&lines[0]);
         assert!(only.contains('┊'), "output lacks dotted gutter: {only}");
         assert!(only.contains("hello world"), "output text missing: {only}");
+    }
+
+    #[test]
+    fn verbose_output_shows_all_lines_no_marker() {
+        // More lines than the tail cap, so collapsed view truncates with a marker.
+        let output: String = (0..OUTPUT_MAX_LINES + 5)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+
+        let collapsed = output_lines(&output, 40, false);
+        let collapsed_text: String = collapsed.iter().map(line_text).collect();
+        assert!(
+            collapsed_text.contains("earlier lines"),
+            "collapsed view should mark hidden lines"
+        );
+        assert!(
+            !collapsed_text.contains("line 0"),
+            "tail should hide the head"
+        );
+
+        let expanded = output_lines(&output, 40, true);
+        let expanded_text: String = expanded.iter().map(line_text).collect();
+        assert!(
+            !expanded_text.contains("earlier lines"),
+            "verbose view should have no truncation marker"
+        );
+        assert!(
+            expanded_text.contains("line 0") && expanded_text.contains("line 29"),
+            "verbose view should show the whole output"
+        );
     }
 
     #[test]
@@ -844,6 +1276,26 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
         let t = line_text(&status_line(&c));
         assert!(t.contains("error") && t.contains("0.4s"), "got: {t}");
         assert!(t.contains("exit 2"), "got: {t}");
+    }
+
+    #[test]
+    fn status_line_reflects_cancel_phase() {
+        let mut c = code_cell();
+
+        // While running, the label tracks the escalation.
+        c.state = CodeBlockState::Running;
+        c.cancel = Cancel::Interrupting;
+        assert!(line_text(&status_line(&c)).contains("canceling"));
+        c.cancel = Cancel::Killing;
+        assert!(line_text(&status_line(&c)).contains("killing"));
+
+        // Once the interrupted run finishes (signal → error), it names the outcome.
+        c.state = CodeBlockState::Error;
+        c.cancel = Cancel::Interrupting;
+        let t = line_text(&status_line(&c));
+        assert!(t.contains("canceled") && !t.contains("error"), "got: {t}");
+        c.cancel = Cancel::Killing;
+        assert!(line_text(&status_line(&c)).contains("killed"));
     }
 
     #[test]

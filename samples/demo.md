@@ -44,6 +44,13 @@ echo "Oh no!"
 echo $PWD
 exit 1
 ```
+Where are we working and where is the temp dir?
+
+```sh
+echo "Here: $PWD"
+echo "Temp: $TMP_DIR"
+ls $TMP_DIR
+```
 
 ## A cell you can opt out of
 

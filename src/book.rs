@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
@@ -26,6 +26,17 @@ pub struct Runbook {
     /// Keep-alive for an auto-created temp dir. Dropping it removes the directory,
     /// so it must live as long as the runbook (unless `skip_cleanup` persisted it).
     tmp_guard: Option<tempfile::TempDir>,
+
+    /// The original document text. Retained so a markdown block can be copied back
+    /// out as its exact source (via the `mdast` node's byte offsets).
+    source: String,
+
+    /// Extra environment overlaid on the frontmatter `env` for every cell — the merge
+    /// point for CLI `--env` (and any future sources). Empty until something sets it;
+    /// it overrides frontmatter keys and is surfaced in the header via [`base_env`].
+    ///
+    /// [`base_env`]: Runbook::base_env
+    pub cli_env: HashMap<String, String>,
 }
 
 impl Runbook {
@@ -79,6 +90,8 @@ impl Runbook {
             last_run: None,
             tmp_dir: None,
             tmp_guard: None,
+            source: doc.to_string(),
+            cli_env: HashMap::new(),
         })
     }
 
@@ -88,6 +101,15 @@ impl Runbook {
             Some(BookBlock::Input(cell)) => Some(cell),
             _ => None,
         }
+    }
+
+    /// The active temp directory as an env-var `(name, path)` pair, if one has been
+    /// created yet. The dir is made lazily on first run, so this is `None` until then.
+    /// Used by the header to surface the path for the user.
+    pub fn tmp_dir_env(&self) -> Option<(String, String)> {
+        self.tmp_dir
+            .as_ref()
+            .map(|p| (self.tmp_dir_var_name(), p.display().to_string()))
     }
 
     /// Name of the env var pointing at the temp dir (`TMP_DIR` by default).
@@ -159,11 +181,19 @@ impl Runbook {
 
     /// The full script for a cell: frontmatter `before_each`, the cell body, then
     /// `after_each`, joined with newlines.
+    ///
+    /// When `before_each` is omitted it defaults to `set -eu` (errexit + nounset), so
+    /// a failing command or an unset variable fails the cell loudly instead of
+    /// limping on. An explicit `before_each: ""` opts out; any custom value replaces
+    /// the default. `pipefail` is intentionally *not* in the default — it isn't POSIX
+    /// `sh`, so it would break non-bash shells. Stream merging (`exec 2>&1`) is a
+    /// separate, always-on concern handled by the runner, not this default.
     pub fn script_for(&self, c: &CodeBlock) -> String {
         let mut s = String::new();
-        if let Some(b) = &self.frontmatter.before_each {
-            s.push_str(b);
-            if !b.ends_with('\n') {
+        let before = self.frontmatter.before_each.as_deref().unwrap_or("set -eu");
+        if !before.is_empty() {
+            s.push_str(before);
+            if !before.ends_with('\n') {
                 s.push('\n');
             }
         }
@@ -178,14 +208,15 @@ impl Runbook {
     }
 
     /// Build the environment map injected into the cell at `idx` (DESIGN §4):
-    /// frontmatter `env`, then `TMP_DIR`, then every *preceding* answered input
-    /// cell's `target=value` in document order (later answers win).
+    /// frontmatter `env`, then CLI `--env`, then `TMP_DIR`, then every *preceding*
+    /// answered input cell's `target=value` in document order (later layers win).
     pub fn env_for(&self, idx: usize) -> HashMap<String, String> {
         let mut map = HashMap::new();
 
         if let Some(env) = &self.frontmatter.env {
             map.extend(env.clone());
         }
+        map.extend(self.cli_env.clone());
         if let Some(tmp) = &self.tmp_dir {
             map.insert(self.tmp_dir_var_name(), tmp.display().to_string());
         }
@@ -197,6 +228,18 @@ impl Runbook {
             }
         }
 
+        map
+    }
+
+    /// The base environment shown in the header: frontmatter `env` overlaid with CLI
+    /// `--env`, sorted by key. Per-cell additions — `TMP_DIR`, answered inputs — are
+    /// layered on only at run time by [`env_for`], so they're deliberately excluded.
+    pub fn base_env(&self) -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        if let Some(env) = &self.frontmatter.env {
+            map.extend(env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        map.extend(self.cli_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         map
     }
 
@@ -218,6 +261,69 @@ impl Runbook {
             }
         }
         c
+    }
+
+    /// The text to copy for the block at `idx`, by kind:
+    /// - **code** → the raw cell body (not the fenced ```` ``` ```` block);
+    /// - **markdown** → its exact source, sliced from the original document via the
+    ///   `mdast` node's byte offsets;
+    /// - **input** → not copyable (`None`).
+    ///
+    /// `None` if the index is out of range, the block is an input cell, or a markdown
+    /// node lacks position info.
+    pub fn copy_text(&self, idx: usize) -> Option<String> {
+        match self.blocks.get(idx)? {
+            BookBlock::Code(c) => Some(c.content.clone()),
+            BookBlock::Input(_) => None,
+            BookBlock::Md(node) => {
+                let pos = node.position()?;
+                self.source
+                    .get(pos.start.offset..pos.end.offset)
+                    .map(str::to_string)
+            }
+        }
+    }
+
+    /// The captured stdout+stderr of the code cell at `idx`, for copying its output.
+    /// `None` if the index is out of range, the block isn't a code cell, or the cell
+    /// has produced no output yet (nothing to copy).
+    pub fn output_text(&self, idx: usize) -> Option<String> {
+        match self.blocks.get(idx)? {
+            BookBlock::Code(c) if !c.output.is_empty() => Some(c.output.clone()),
+            _ => None,
+        }
+    }
+
+    /// Reset every cell to its initial state: code outputs cleared and un-run, input
+    /// answers discarded. Prose is untouched. Also forgets `last_run` and discards the
+    /// auto-created temp directory (see [`Runbook::reset_tmp_dir`]) so the next run
+    /// starts fresh.
+    pub fn clear_all(&mut self) {
+        for block in &mut self.blocks {
+            match block {
+                BookBlock::Code(c) => c.clear(),
+                BookBlock::Input(i) => i.clear(),
+                BookBlock::Md(_) => {}
+            }
+        }
+        self.last_run = None;
+        self.reset_tmp_dir();
+    }
+
+    /// Discard the auto-created temp directory so the next [`ensure_tmp_dir`] mints a
+    /// fresh one. Dropping `tmp_guard` removes the old directory from disk; clearing
+    /// `tmp_dir` forces re-creation on next use.
+    ///
+    /// A user-configured `tmp_dir.path` or a `skip_cleanup` directory has no guard and
+    /// is deliberately left untouched — it is the user's directory to manage, not ours
+    /// to delete out from under them.
+    ///
+    /// [`ensure_tmp_dir`]: Runbook::ensure_tmp_dir
+    pub fn reset_tmp_dir(&mut self) {
+        if self.tmp_guard.is_some() {
+            self.tmp_guard = None; // Drop removes the old directory.
+            self.tmp_dir = None; // Next ensure_tmp_dir creates a fresh one.
+        }
     }
 }
 
@@ -271,6 +377,22 @@ pub struct CodeBlock {
     /// Exit code of the last finished run, if the process exited normally (`None`
     /// if killed by a signal). Surfaced on the status line only when non-zero.
     pub exit_code: Option<i32>,
+    /// How far the user has escalated a cancellation of this run. While `Running` it
+    /// reads as "canceling…/killing…"; once finished it labels the outcome
+    /// "canceled/killed" instead of a plain error. Reset by [`CodeBlock::begin_run`].
+    pub cancel: Cancel,
+}
+
+/// A cell's cancellation phase — the strongest stop signal sent to its run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Cancel {
+    /// No stop requested.
+    #[default]
+    None,
+    /// SIGINT sent, awaiting exit (a graceful cancel).
+    Interrupting,
+    /// SIGKILL sent, awaiting exit (escalated after a cancel didn't take).
+    Killing,
 }
 
 impl CodeBlock {
@@ -286,6 +408,7 @@ impl CodeBlock {
         self.started_at = Some(std::time::Instant::now());
         self.elapsed = None;
         self.exit_code = None;
+        self.cancel = Cancel::None;
         self.state = CodeBlockState::Running;
     }
 
@@ -303,6 +426,16 @@ impl CodeBlock {
         } else {
             CodeBlockState::Error
         };
+    }
+
+    /// Discard any prior run: clear captured output and return to the un-run state.
+    pub fn clear(&mut self) {
+        self.output.clear();
+        self.started_at = None;
+        self.elapsed = None;
+        self.exit_code = None;
+        self.cancel = Cancel::None;
+        self.state = CodeBlockState::NotRun;
     }
 }
 
@@ -328,6 +461,7 @@ impl TryFrom<markdown::mdast::Code> for CodeBlock {
             started_at: None,
             elapsed: None,
             exit_code: None,
+            cancel: Cancel::None,
         })
     }
 }
@@ -348,6 +482,12 @@ pub enum CodeBlockState {
 /// Expected to be deserialized from yaml.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BookFrontmatter {
+    /// Human-readable runbook title (shown in the header).
+    pub title: Option<String>,
+
+    /// One-line description of the runbook (shown in the header).
+    pub description: Option<String>,
+
     /// Configuration for code block interpreters
     pub interpreters: Option<HashMap<String, InterpreterConf>>,
 
@@ -700,6 +840,11 @@ impl InputCell {
         }
     }
 
+    /// Discard any answer (or in-progress edit) and return to pending.
+    pub fn clear(&mut self) {
+        self.state = InputState::Pending;
+    }
+
     /// Cancel editing, restoring a prior answer if there was one.
     pub fn cancel(&mut self) {
         if let InputState::Editing { prior, .. } = &self.state {
@@ -956,6 +1101,7 @@ mod tests {
             started_at: None,
             elapsed: None,
             exit_code: None,
+            cancel: Cancel::None,
         };
         assert!(mk("sh", None).is_runnable());
         assert!(mk("bash", None).is_runnable());
@@ -1001,6 +1147,64 @@ mod tests {
     }
 
     #[test]
+    fn clear_all_resets_cells_and_last_run() {
+        let doc = "---\ntitle: t\n---\n\n\
+            ```json mrthn=input\n{\"type\":\"input\",\"prompt\":\"p\",\"target\":\"T\"}\n```\n\n\
+            ```sh\necho hi\n```\n";
+        let mut rb = Runbook::new(None::<&str>, doc).unwrap();
+
+        // Answer the input and drive the code cell through a finished run.
+        let cell = rb.input_at_mut(0).unwrap();
+        cell.begin_edit();
+        cell.insert_char('z');
+        cell.submit();
+        if let BookBlock::Code(c) = &mut rb.blocks[1] {
+            c.begin_run();
+            c.push_output("out\n");
+            c.finish(false, Some(2));
+        }
+        rb.last_run = Some(1);
+
+        rb.clear_all();
+
+        match &rb.blocks[0] {
+            BookBlock::Input(i) => assert!(matches!(i.state, InputState::Pending)),
+            other => panic!("expected input, got {other:?}"),
+        }
+        match &rb.blocks[1] {
+            BookBlock::Code(c) => {
+                assert!(c.output.is_empty(), "output not cleared");
+                assert_eq!(c.state, CodeBlockState::NotRun);
+                assert!(c.elapsed.is_none() && c.exit_code.is_none());
+            }
+            other => panic!("expected code, got {other:?}"),
+        }
+        assert_eq!(rb.last_run, None);
+    }
+
+    #[test]
+    fn copy_text_yields_source_code_and_value() {
+        let doc = "---\ntitle: t\n---\n\n# Heading\n\n```sh\necho hi\n```\n\n\
+            ```json mrthn=input\n{\"type\":\"input\",\"prompt\":\"Name?\",\"target\":\"WHO\"}\n```\n";
+        let mut rb = Runbook::new(None::<&str>, doc).unwrap();
+
+        // Markdown → exact source; code → raw body (no fence).
+        assert_eq!(rb.copy_text(0).as_deref(), Some("# Heading"));
+        assert_eq!(rb.copy_text(1).as_deref(), Some("echo hi"));
+
+        // Input blocks are not copyable, answered or not.
+        assert_eq!(rb.copy_text(2), None);
+        let cell = rb.input_at_mut(2).unwrap();
+        cell.begin_edit();
+        cell.insert_char('z');
+        cell.submit();
+        assert_eq!(rb.copy_text(2), None);
+
+        // Out of range.
+        assert_eq!(rb.copy_text(99), None);
+    }
+
+    #[test]
     fn interpreter_defaults_and_remaps() {
         let rb = Runbook::new(None::<&str>, "---\ntitle: t\n---\n\n```sh\n:\n```\n").unwrap();
         assert_eq!(rb.interpreter_for("sh"), vec!["/usr/bin/env", "sh"]);
@@ -1019,6 +1223,28 @@ mod tests {
             other => panic!("expected code, got {other:?}"),
         };
         assert_eq!(rb.script_for(c), "set -e\necho body\necho done");
+    }
+
+    #[test]
+    fn script_defaults_before_each_to_strict_mode() {
+        let code = |doc: &str| {
+            let rb = Runbook::new(None::<&str>, doc).unwrap();
+            match &rb.blocks[0] {
+                BookBlock::Code(c) => rb.script_for(c),
+                other => panic!("expected code, got {other:?}"),
+            }
+        };
+
+        // Omitted `before_each` → defaults to `set -eu`.
+        assert_eq!(
+            code("---\ntitle: t\n---\n\n```sh\necho body\n```\n"),
+            "set -eu\necho body"
+        );
+        // Explicit empty string opts out entirely.
+        assert_eq!(
+            code("---\nbefore_each: \"\"\n---\n\n```sh\necho body\n```\n"),
+            "echo body"
+        );
     }
 
     #[test]
@@ -1059,5 +1285,38 @@ mod tests {
             env.get("TMP_DIR").map(String::as_str),
             Some(dir.to_str().unwrap())
         );
+    }
+
+    #[test]
+    fn clear_all_recreates_the_temp_dir() {
+        let mut rb = Runbook::new(None::<&str>, "---\ntitle: t\n---\n\n```sh\n:\n```\n").unwrap();
+        let first = rb.ensure_tmp_dir().unwrap();
+        assert!(first.is_dir());
+
+        // A full clear removes the old auto-created dir and mints a fresh one.
+        rb.clear_all();
+        assert!(!first.exists(), "old temp dir should be removed on clear");
+
+        let second = rb.ensure_tmp_dir().unwrap();
+        assert!(second.is_dir());
+        assert_ne!(first, second, "a new temp dir should be created");
+    }
+
+    #[test]
+    fn clear_all_leaves_an_explicit_temp_dir_untouched() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("explicit");
+        let src = format!(
+            "---\ntmp_dir:\n  path: {}\n---\n\n```sh\n:\n```\n",
+            path.display()
+        );
+        let mut rb = Runbook::new(None::<&str>, &src).unwrap();
+        let dir = rb.ensure_tmp_dir().unwrap();
+        assert_eq!(dir, path);
+
+        // A user-configured dir has no guard, so a clear must not delete it.
+        rb.clear_all();
+        assert!(path.is_dir(), "explicit temp dir must survive a clear");
+        assert_eq!(rb.ensure_tmp_dir().unwrap(), path);
     }
 }

@@ -1,3 +1,4 @@
+pub mod ansi;
 pub mod book;
 pub mod cli;
 pub mod runner;

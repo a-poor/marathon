@@ -46,19 +46,45 @@ runnable block, to make run state legible at a glance.
   input cells (DESIGN §4); `before_each`/`after_each` and `interpreters.<lang>.path`
   remap are honored. `TMP_DIR` is a real `mktemp` dir, cleaned on drop unless
   `skip_cleanup`. Output renders under the cell as the *tail* (last
-  `OUTPUT_MAX_LINES` = 10 lines, "… N earlier lines" marker above). Status
+  `OUTPUT_MAX_LINES` = 25 lines, "… N earlier lines" marker above). Status
   (`CodeBlockState`) and the output buffer are separate fields, per the three-tier
   note. `runner::run_script` (collect-all) is kept for the non-TUI `exec` path.
+  - **stdout/stderr ordering: built.** For shell cells the runner prepends
+    `exec 2>&1` (`runner::merge_streams`, gated by `is_shell`), so the child merges
+    stderr into stdout *at the source*; we then read one ordered stdout stream
+    (`stream_inner` dropped its two-pipe `select!`). True written order, no pty.
+    Custom non-shell interpreters skip the merge (stderr → `null`). Strict mode is on
+    too: `before_each` now defaults to `set -eu` when omitted (`Runbook::script_for`),
+    overridable, with an explicit `before_each: ""` opting out. `pipefail` is *not* in
+    the default — it isn't POSIX `sh` and would break dash.
+  - **Output sanitization: built.** Cell output is cleaned at the TUI boundary
+    before rendering (`ansi::sanitize`, called from `output_lines` and the `Y`
+    copy-output path; CLI keeps raw bytes per DESIGN §7). It strips ANSI/CSI/OSC
+    escapes (via `strip-ansi-escapes`), collapses `\r` progress rewrites to the
+    final segment, normalizes CRLF, expands tabs to 8-col stops, and drops residual
+    control bytes — ordered so `\r`/`\t` are handled *before* the vte-based strip
+    (which would otherwise eat them). TUI runs also inject `NO_COLOR=1` into the
+    child env (overridable) so many tools emit no SGR at all.
   Still deferred:
-  - **ANSI / true stdout-stderr ordering** (DESIGN §7) — streams are merged by
-    arrival, not strictly ordered (needs a pty); ANSI escapes are passed through
-    raw, not interpreted.
+  - **ANSI color rendering** (DESIGN §7) — the MVP is the *strip-everything* path:
+    SGR color is removed, not rendered. The follow-up parses SGR into ratatui styles
+    (e.g. `ansi-to-tui`) so colored output survives. Edge case the eventual
+    vte-grid/SGR path also fixes: a tab right after an escape miscounts its column.
+  - **stderr redirection / output sinks** (DESIGN §7) — let a cell send stderr
+    (and/or stdout) somewhere other than the merged inline view: `stderr=/dev/null`
+    to drop it, or `stderr=$TMP_DIR/run.log` to capture it. Today shell cells merge
+    stderr into stdout at the source (`exec 2>&1`) with no way to split or discard
+    either stream; needs the runner to honor per-block redirection config instead of
+    always merging.
+  - **Terminal fidelity / pty** (DESIGN §7) — piped programs see no tty (so they
+    disable color / use full buffering). A real pty would fix both; ordering itself
+    is already handled by the source-merge above.
   - **Animated spinner while running** — needs a draw-time overlay (the running
     status line is in the cached doc, so it can't animate without a per-frame
     `revision` bump). Lands with the overlay/`DocLayout` work.
   - ~~**Run metadata** — elapsed time + exit code on the cell.~~ **Built** — see
     the "Code block output" section above.
-  - **Verbose toggle** to expand past the 10-line output tail.
+  - **Verbose toggle** to expand past the 25-line output tail.
 
 - **Footer / status bar: wired to real run state.** The bottom bar's badge now
   reflects an aggregate derived fresh each frame from `Runbook::run_counts()`:
@@ -88,6 +114,26 @@ runnable block, to make run state legible at a glance.
     unblocked* — `TMP_DIR` exists, so a preceding cell can produce the file.
   - **Multi-select**, and a **real terminal cursor** for the text field (today's
     caret is a synthetic reversed cell, fine for the flat-line scrollview).
+
+## Testing & robustness
+
+The current suite is unit-level and happy-path-ish. Before (or alongside) the CLI
+work, broaden it — especially around untrusted/odd input, where a panic is a real
+risk:
+
+- **More extensive testing, including fuzzing.** `ansi::sanitize` and the markdown
+  → `Runbook` parse path both take arbitrary bytes from the outside world (command
+  output; user-authored runbooks) and should never panic, hang, or emit corrupting
+  control bytes. Good fuzz targets: feed `sanitize` random byte streams (assert the
+  result contains no ESC/CSI/OSC and no C0 controls except `\n`); feed the parser
+  random markdown/frontmatter (assert it returns `Err` or a valid `Runbook`, never
+  panics). `cargo-fuzz` (libFuzzer) or `arbitrary` + `proptest` for property tests.
+- **Round-trip / golden tests** for output rendering — sample command outputs
+  (git, cargo, docker progress bars, colored `ls`) snapshotted through `sanitize`
+  to catch regressions in the strip/collapse/expand logic.
+- **Streaming edge cases** — escape sequences and `\r` rewrites split across chunk
+  boundaries (the runner sends arbitrary-sized chunks; `sanitize` runs on the full
+  accumulated buffer, so this should hold, but it's untested).
 
 ## Decisions
 

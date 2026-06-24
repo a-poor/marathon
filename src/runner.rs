@@ -10,6 +10,7 @@
 //! ANSI handling are deferred (DESIGN §7).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
 
 use anyhow::Result;
@@ -29,6 +30,10 @@ pub struct RunResult {
 /// A message from a spawned cell run back to the UI loop.
 #[derive(Debug)]
 pub enum RunMsg {
+    /// The cell's process has spawned, carrying its OS process id so the UI can send
+    /// it a signal (e.g. SIGINT to cancel). On unix the child leads its own process
+    /// group, so signalling `-pid` reaches the shell *and* its descendants.
+    Started { idx: usize, pid: u32 },
     /// A line of output (stdout or stderr) streamed from a running cell. The chunk
     /// already includes its trailing newline.
     Output { idx: usize, chunk: String },
@@ -39,6 +44,31 @@ pub enum RunMsg {
         success: bool,
         code: Option<i32>,
     },
+}
+
+/// Whether `interp` invokes a recognized POSIX shell (`sh`/`bash`/`zsh`), matching
+/// any token's basename — so `["/usr/bin/env", "sh"]`, `["/bin/bash"]`, and
+/// `["/bin/zsh", "-f"]` all count, but a custom non-shell interpreter does not. Used
+/// to gate the `exec 2>&1` merge, which only a shell understands.
+fn is_shell(interp: &[String]) -> bool {
+    interp.iter().any(|s| {
+        Path::new(s)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|name| matches!(name, "sh" | "bash" | "zsh"))
+    })
+}
+
+/// Prepend `exec 2>&1` so the shell points its stderr at stdout *at the source*,
+/// yielding one stream in true written order (DESIGN §7). Only for recognized shells
+/// — a non-shell interpreter wouldn't understand the redirect, so it's left as-is and
+/// keeps its separate streams.
+fn merge_streams(interp: &[String], script: &str) -> String {
+    if is_shell(interp) {
+        format!("exec 2>&1\n{script}")
+    } else {
+        script.to_owned()
+    }
 }
 
 /// Run `script` through `interp` (e.g. `["/usr/bin/env", "sh"]`) with `env`
@@ -65,7 +95,7 @@ pub async fn run_script(
     // Feed the script on a separate task so a child that floods stdout before
     // draining stdin can't deadlock against our write.
     let mut stdin = child.stdin.take().expect("stdin piped");
-    let script = script.to_owned();
+    let script = merge_streams(interp, script);
     let writer = tokio::spawn(async move {
         let _ = stdin.write_all(script.as_bytes()).await;
         // stdin dropped here → EOF for the child.
@@ -90,11 +120,11 @@ pub async fn run_script(
 }
 
 /// Run a cell and stream its output line-by-line back over `tx`: a [`RunMsg::Output`]
-/// per line (stdout and stderr merged), then exactly one [`RunMsg::Finished`]. This
-/// is the path the TUI uses so long-running cells reveal output as it arrives.
+/// per line, then exactly one [`RunMsg::Finished`]. This is the path the TUI uses so
+/// long-running cells reveal output as it arrives.
 ///
-/// stdout/stderr are interleaved by arrival, not strictly ordered — true ordering
-/// needs a pty and is deferred (DESIGN §7).
+/// For shell cells, stderr is merged into stdout at the source via `exec 2>&1` (see
+/// [`merge_streams`]), so the single stream we read is already in true written order.
 pub async fn run_streaming(
     idx: usize,
     interp: Vec<String>,
@@ -122,6 +152,11 @@ pub async fn run_streaming(
 
 /// Spawn the process, pump output lines to `tx`, and return the success flag. Sends
 /// no `Finished` — the caller does, so spawn errors get a uniform path.
+///
+/// stderr is merged into stdout in the child (`exec 2>&1`), so we read a single
+/// stream and never have to interleave two pipes. For a non-shell interpreter (no
+/// merge) stderr goes to `Stdio::null` rather than being captured — acceptable since
+/// the runnable cells are shells; richer non-shell capture can come with the pty work.
 async fn stream_inner(
     idx: usize,
     interp: &[String],
@@ -129,40 +164,41 @@ async fn stream_inner(
     env: &HashMap<String, String>,
     tx: &UnboundedSender<RunMsg>,
 ) -> Result<(bool, Option<i32>)> {
+    let script = merge_streams(interp, script);
     let (program, args) = interp
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("empty interpreter"))?;
 
-    let mut child = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .envs(env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::null());
+    // Run in a fresh process group (leader = the child) so a cancel can signal the
+    // whole job — the shell and anything it spawned — via `kill(-pid, …)`.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd.spawn()?;
+
+    // Hand the pid back so the UI can signal it (e.g. SIGINT to cancel).
+    if let Some(pid) = child.id() {
+        let _ = tx.send(RunMsg::Started { idx, pid });
+    }
 
     // Feed the script on a separate task (see `run_script`).
     let mut stdin = child.stdin.take().expect("stdin piped");
-    let script = script.to_owned();
     let writer = tokio::spawn(async move {
         let _ = stdin.write_all(script.as_bytes()).await;
     });
 
     let mut out_lines = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
-    let mut err_lines = BufReader::new(child.stderr.take().expect("stderr piped")).lines();
-    let (mut out_done, mut err_done) = (false, false);
-
-    while !(out_done && err_done) {
-        tokio::select! {
-            r = out_lines.next_line(), if !out_done => match r {
-                Ok(Some(l)) => { let _ = tx.send(RunMsg::Output { idx, chunk: format!("{l}\n") }); }
-                _ => out_done = true,
-            },
-            r = err_lines.next_line(), if !err_done => match r {
-                Ok(Some(l)) => { let _ = tx.send(RunMsg::Output { idx, chunk: format!("{l}\n") }); }
-                _ => err_done = true,
-            },
-        }
+    while let Some(l) = out_lines.next_line().await? {
+        let _ = tx.send(RunMsg::Output {
+            idx,
+            chunk: format!("{l}\n"),
+        });
     }
 
     let status = child.wait().await?;
@@ -219,6 +255,10 @@ mod tests {
         let mut finished = None;
         while let Ok(msg) = rx.try_recv() {
             match msg {
+                RunMsg::Started { idx, pid } => {
+                    assert_eq!(idx, 7);
+                    assert!(pid > 0);
+                }
                 RunMsg::Output { idx, chunk } => {
                     assert_eq!(idx, 7);
                     chunks.push(chunk);
@@ -231,6 +271,64 @@ mod tests {
         }
         assert_eq!(chunks, vec!["a\n", "b\n", "c\n"]);
         assert_eq!(finished, Some((true, Some(0))));
+    }
+
+    #[test]
+    fn is_shell_keys_on_basename() {
+        assert!(is_shell(&["/usr/bin/env".into(), "sh".into()]));
+        assert!(is_shell(&["/bin/bash".into()]));
+        assert!(is_shell(&["/bin/zsh".into(), "-f".into()])); // shell with a flag
+        assert!(!is_shell(&["/usr/bin/env".into(), "python3".into()]));
+        assert!(!is_shell(&[]));
+    }
+
+    #[tokio::test]
+    async fn merges_stderr_into_stdout_in_written_order() {
+        // stdout, stderr, stdout — `exec 2>&1` must preserve this exact order, which
+        // two separate pipes could not guarantee.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        run_streaming(
+            0,
+            sh(),
+            "echo one\necho two 1>&2\necho three".into(),
+            HashMap::new(),
+            tx,
+        )
+        .await;
+
+        let mut chunks = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let RunMsg::Output { chunk, .. } = msg {
+                chunks.push(chunk);
+            }
+        }
+        assert_eq!(chunks, vec!["one\n", "two\n", "three\n"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigint_cancels_a_running_cell() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        let handle = tokio::spawn(run_streaming(0, sh(), "sleep 5".into(), HashMap::new(), tx));
+
+        // Wait for the spawned pid, then SIGINT its whole process group.
+        let pid = loop {
+            match rx.recv().await {
+                Some(RunMsg::Started { pid, .. }) => break pid,
+                Some(_) => continue,
+                None => panic!("run ended before a Started message"),
+            }
+        };
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGINT);
+        }
+
+        handle.await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "cancel did not interrupt the 5s sleep"
+        );
     }
 
     #[tokio::test]
