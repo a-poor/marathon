@@ -24,6 +24,23 @@ cargo install --git https://github.com/a-poor/marathon
 
 Or you can download a pre-compiled binary from the [releases](https://github.com/a-poor/marathon/releases).
 
+### Shell completions
+
+The Homebrew cask installs shell completions automatically. If you installed
+another way, generate them yourself with `marathon completions <shell>`
+(`bash`, `zsh`, `fish`, `elvish`, or `powershell`):
+
+```sh
+# zsh — write to a directory on your $fpath, then run `compinit`
+marathon completions zsh > ~/.zfunc/_marathon
+
+# bash
+marathon completions bash | sudo tee /usr/local/etc/bash_completion.d/marathon
+
+# fish
+marathon completions fish > ~/.config/fish/completions/marathon.fish
+```
+
 ## Writing Runbooks
 
 Marathon tries to get out of your way. All you have to do is open up a markdown file and start to add some code blocks.

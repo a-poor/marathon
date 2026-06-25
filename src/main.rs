@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use marathon::book::{BookBlock, Runbook};
-use marathon::cli::{ExecCmd, NewCmd, RunCmd, SkillsCmd, SkillsSub, ValidateCmd};
+use marathon::cli::{App, CompletionsCmd, ExecCmd, NewCmd, RunCmd, SkillsCmd, SkillsSub, ValidateCmd};
 use marathon::runner::RunMsg;
 use std::collections::HashMap;
 use std::io::Write;
@@ -17,7 +17,18 @@ async fn main() -> Result<()> {
         marathon::cli::RootCmd::Validate(cmd) => validate(cmd).await,
         marathon::cli::RootCmd::New(cmd) => new(cmd).await,
         marathon::cli::RootCmd::Skills(cmd) => skills(cmd).await,
+        marathon::cli::RootCmd::Completions(cmd) => completions(cmd),
     }
+}
+
+/// `completions`: print a shell completion script for `shell` to stdout. Synchronous
+/// — it just renders clap's command tree; the caller can pipe it to the right file
+/// (e.g. `marathon completions zsh > ~/.zfunc/_marathon`).
+fn completions(cmd: CompletionsCmd) -> Result<()> {
+    let mut command = App::command();
+    let name = command.get_name().to_string();
+    clap_complete::generate(cmd.shell, &mut command, name, &mut std::io::stdout());
+    Ok(())
 }
 
 /// Load a runbook from disk and parse it, layering in CLI `--env` overrides.

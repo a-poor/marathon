@@ -40,6 +40,15 @@ pub enum RootCmd {
 
     /// Manage marathon's Claude Code agent skills
     Skills(SkillsCmd),
+
+    /// Print a shell completion script to stdout
+    Completions(CompletionsCmd),
+}
+
+#[derive(Debug, Args)]
+pub struct CompletionsCmd {
+    /// Shell to generate completions for (e.g. bash, zsh, fish, elvish, powershell)
+    pub shell: clap_complete::Shell,
 }
 
 #[derive(Debug, Args)]
