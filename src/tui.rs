@@ -388,8 +388,8 @@ impl App {
         let Some(idx) = self.selected_block() else {
             return;
         };
-        if let Some(cell) = self.book.input_at_mut(idx) {
-            cell.begin_edit();
+        if self.book.input_at_mut(idx).is_some() {
+            self.book.begin_edit_at(idx);
             self.mode = Mode::Active;
             self.revision += 1;
         }

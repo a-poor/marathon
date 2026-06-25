@@ -1122,7 +1122,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
     #[test]
     fn confirm_editing_marks_chosen_option() {
         let mut c = confirm_cell();
-        c.begin_edit();
+        c.begin_edit(&std::collections::HashMap::new());
         c.set_confirm(true);
         let lines = input_lines(&c, 80);
         // The "Yes" span carries the reversed+bold "chosen" style.
@@ -1137,7 +1137,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
     #[test]
     fn select_editing_marks_current_row() {
         let mut c = select_cell();
-        c.begin_edit();
+        c.begin_edit(&std::collections::HashMap::new());
         c.select_move(true); // highlight "beta"
         let lines = input_lines(&c, 80);
         let marked = lines
@@ -1301,7 +1301,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
     #[test]
     fn answered_cell_shows_value() {
         let mut c = confirm_cell();
-        c.begin_edit();
+        c.begin_edit(&std::collections::HashMap::new());
         c.set_confirm(true);
         c.submit();
         let lines = input_lines(&c, 80);

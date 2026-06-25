@@ -103,6 +103,20 @@ impl Runbook {
         }
     }
 
+    /// Begin editing the input cell at `idx`, if that block is one. Builds the
+    /// cell's environment ([`env_for`]) first so a select cell's `option_file`
+    /// path can reference `TMP_DIR` or an earlier answer.
+    ///
+    /// [`env_for`]: Runbook::env_for
+    pub fn begin_edit_at(&mut self, idx: usize) {
+        // `env_for` returns an owned map, so its immutable borrow of `self` ends
+        // before we take the mutable block borrow below.
+        let env = self.env_for(idx);
+        if let Some(BookBlock::Input(cell)) = self.blocks.get_mut(idx) {
+            cell.begin_edit(&env);
+        }
+    }
+
     /// The active temp directory as an env-var `(name, path)` pair, if one has been
     /// created yet. The dir is made lazily on first run, so this is `None` until then.
     /// Used by the header to surface the path for the user.
@@ -660,6 +674,11 @@ impl MagicInputBlock {
 pub struct InputCell {
     pub config: MagicInputBlock,
     pub state: InputState,
+    /// Resolved select options: the inline `options` list followed by any lines
+    /// read from `option_file`. Recomputed on `begin_edit` (and seeded at
+    /// construction) so a file produced by a preceding cell at runtime is picked
+    /// up. Always empty for non-select cells.
+    loaded_options: Vec<String>,
 }
 
 /// Where an input cell is in its lifecycle.
@@ -755,12 +774,87 @@ impl TextDraft {
     }
 }
 
+/// Expand `$NAME` / `${NAME}` references in `input` against `env`, where a name
+/// is `[A-Za-z_][A-Za-z0-9_]*`. This is a *lookup only* — deliberately not a
+/// shell: there is no command substitution, no `${VAR:-default}`, no arithmetic,
+/// and no tilde expansion. A `$` that doesn't begin a valid reference, or one
+/// naming an unknown variable, is left untouched; `$$` is a literal `$`.
+fn expand_env(input: &str, env: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            // `$$` -> literal `$`
+            Some('$') => {
+                chars.next();
+                out.push('$');
+            }
+            // `${NAME}`
+            Some('{') => {
+                chars.next();
+                let mut name = String::new();
+                let mut closed = false;
+                for ch in chars.by_ref() {
+                    if ch == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(ch);
+                }
+                match env.get(&name) {
+                    Some(v) if closed => out.push_str(v),
+                    // Unknown or unterminated: leave the original text in place.
+                    _ => {
+                        out.push_str("${");
+                        out.push_str(&name);
+                        if closed {
+                            out.push('}');
+                        }
+                    }
+                }
+            }
+            // `$NAME`
+            Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {
+                let mut name = String::new();
+                while let Some(&ch) = chars.peek() {
+                    if ch.is_ascii_alphanumeric() || ch == '_' {
+                        name.push(ch);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                match env.get(&name) {
+                    Some(v) => out.push_str(v),
+                    None => {
+                        out.push('$');
+                        out.push_str(&name);
+                    }
+                }
+            }
+            // Trailing or loose `$`.
+            _ => out.push('$'),
+        }
+    }
+    out
+}
+
 impl InputCell {
     pub fn new(config: MagicInputBlock) -> Self {
-        Self {
+        let mut cell = Self {
             config,
             state: InputState::Pending,
-        }
+            loaded_options: Vec::new(),
+        };
+        // Seed inline options (and any already-present, non-templated file).
+        // Variable-bearing `option_file` paths resolve later, on `begin_edit`,
+        // once an env (and `TMP_DIR`) exists.
+        cell.refresh_options(&HashMap::new());
+        cell
     }
 
     pub fn prompt(&self) -> &str {
@@ -777,12 +871,37 @@ impl InputCell {
 
     /// The select options (empty for non-select cells, or if none configured).
     pub fn options(&self) -> &[String] {
-        match &self.config {
-            MagicInputBlock::Select {
-                options: Some(o), ..
-            } => o,
-            _ => &[],
+        &self.loaded_options
+    }
+
+    /// Recompute the cached select options from the inline `options` list plus
+    /// any lines in `option_file`. The path has `$NAME`/`${NAME}` expanded
+    /// against `env` (see [`expand_env`]), so it can reference `TMP_DIR` or an
+    /// earlier answer. Read lazily so a file produced by a preceding cell at
+    /// runtime is picked up; blank lines are skipped and surrounding whitespace
+    /// trimmed. Best-effort — an unreadable `option_file` leaves just the inline
+    /// options. No-op for non-select cells.
+    pub fn refresh_options(&mut self, env: &HashMap<String, String>) {
+        let MagicInputBlock::Select {
+            options,
+            option_file,
+            ..
+        } = &self.config
+        else {
+            return;
+        };
+        let mut opts: Vec<String> = options.clone().unwrap_or_default();
+        if let Some(raw) = option_file
+            && let Ok(text) = std::fs::read_to_string(expand_env(raw, env))
+        {
+            opts.extend(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string),
+            );
         }
+        self.loaded_options = opts;
     }
 
     fn option_at(&self, idx: usize) -> Option<&str> {
@@ -804,7 +923,11 @@ impl InputCell {
     }
 
     /// Begin editing, seeding a draft from any prior answer or sensible default.
-    pub fn begin_edit(&mut self) {
+    /// `env` is the cell's environment (from [`Runbook::env_for`]), used to
+    /// expand a select cell's `option_file` path.
+    pub fn begin_edit(&mut self, env: &HashMap<String, String>) {
+        // Re-read `option_file` in case a preceding cell just produced it.
+        self.refresh_options(env);
         let prior = match &self.state {
             InputState::Answered { value } => Some(value.clone()),
             _ => None,
@@ -979,14 +1102,123 @@ mod tests {
     }
 
     #[test]
+    fn select_reads_option_file_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("choices.txt");
+        std::fs::write(&path, "alpha\n  beta  \n\ngamma\n").unwrap();
+
+        let mut cell = InputCell::new(MagicInputBlock::Select {
+            prompt: "Pick".into(),
+            target: "CHOICE".into(),
+            options: None,
+            option_file: Some(path.display().to_string()),
+        });
+        // Trimmed, blank lines skipped.
+        assert_eq!(cell.options(), ["alpha", "beta", "gamma"]);
+
+        // Picking the second option resolves to its value.
+        cell.begin_edit(&HashMap::new());
+        cell.select_move(true);
+        cell.submit();
+        assert_eq!(cell.resolved(), Some(("CHOICE", "beta")));
+    }
+
+    #[test]
+    fn select_inline_options_precede_file_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("choices.txt");
+        std::fs::write(&path, "from_file\n").unwrap();
+
+        let cell = InputCell::new(MagicInputBlock::Select {
+            prompt: "Pick".into(),
+            target: "CHOICE".into(),
+            options: Some(vec!["inline".into()]),
+            option_file: Some(path.display().to_string()),
+        });
+        assert_eq!(cell.options(), ["inline", "from_file"]);
+    }
+
+    #[test]
+    fn select_picks_up_file_produced_after_construction() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("choices.txt");
+
+        // File does not exist yet at construction (e.g. a preceding cell will
+        // create it). Best-effort read leaves the cell with no options.
+        let mut cell = InputCell::new(MagicInputBlock::Select {
+            prompt: "Pick".into(),
+            target: "CHOICE".into(),
+            options: None,
+            option_file: Some(path.display().to_string()),
+        });
+        assert!(cell.options().is_empty());
+
+        // The file appears, then the user activates the cell.
+        std::fs::write(&path, "late\n").unwrap();
+        cell.begin_edit(&HashMap::new());
+        assert_eq!(cell.options(), ["late"]);
+    }
+
+    #[test]
+    fn select_expands_vars_in_option_file_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("choices.txt"), "one\ntwo\n").unwrap();
+
+        let mut cell = InputCell::new(MagicInputBlock::Select {
+            prompt: "Pick".into(),
+            target: "CHOICE".into(),
+            options: None,
+            option_file: Some("${TMP_DIR}/choices.txt".into()),
+        });
+        // Unresolved at construction (no env): the literal `${TMP_DIR}` path
+        // doesn't exist, so no options yet.
+        assert!(cell.options().is_empty());
+
+        // On edit, the env supplies TMP_DIR and the path resolves.
+        let env = HashMap::from([("TMP_DIR".to_string(), dir.path().display().to_string())]);
+        cell.begin_edit(&env);
+        assert_eq!(cell.options(), ["one", "two"]);
+    }
+
+    #[test]
+    fn expand_env_lookup_forms() {
+        let env = HashMap::from([
+            ("TMP_DIR".to_string(), "/tmp/x".to_string()),
+            ("WHO".to_string(), "ann".to_string()),
+        ]);
+        // `$NAME` and `${NAME}`.
+        assert_eq!(expand_env("$TMP_DIR/f.txt", &env), "/tmp/x/f.txt");
+        assert_eq!(expand_env("${TMP_DIR}/f.txt", &env), "/tmp/x/f.txt");
+        // `${NAME}` lets a name butt up against following word chars.
+        assert_eq!(expand_env("${WHO}_file", &env), "ann_file");
+        // `$NAME` stops at the first non-word char.
+        assert_eq!(expand_env("$WHO-x", &env), "ann-x");
+    }
+
+    #[test]
+    fn expand_env_leaves_unknown_and_loose_dollars_literal() {
+        let env = HashMap::from([("WHO".to_string(), "ann".to_string())]);
+        // Unknown var: left untouched (both forms).
+        assert_eq!(expand_env("$NOPE/x", &env), "$NOPE/x");
+        assert_eq!(expand_env("${NOPE}/x", &env), "${NOPE}/x");
+        // Unterminated `${`: left untouched.
+        assert_eq!(expand_env("${WHO", &env), "${WHO");
+        // A loose `$` (not a reference) survives.
+        assert_eq!(expand_env("cost is $5", &env), "cost is $5");
+        assert_eq!(expand_env("trailing $", &env), "trailing $");
+        // `$$` is a literal `$` — not a recursive expansion.
+        assert_eq!(expand_env("$$WHO", &env), "$WHO");
+    }
+
+    #[test]
     fn confirm_submit_writes_yes_no() {
         let mut c = confirm();
-        c.begin_edit();
+        c.begin_edit(&HashMap::new());
         // Default seed is No.
         c.submit();
         assert_eq!(c.resolved(), Some(("OK", "no")));
 
-        c.begin_edit();
+        c.begin_edit(&HashMap::new());
         c.set_confirm(true);
         c.submit();
         assert_eq!(c.resolved(), Some(("OK", "yes")));
@@ -995,7 +1227,7 @@ mod tests {
     #[test]
     fn confirm_toggle_flips() {
         let mut c = confirm();
-        c.begin_edit();
+        c.begin_edit(&HashMap::new());
         c.toggle_confirm();
         c.submit();
         assert_eq!(c.resolved(), Some(("OK", "yes")));
@@ -1004,7 +1236,7 @@ mod tests {
     #[test]
     fn text_edit_inserts_and_deletes() {
         let mut c = text();
-        c.begin_edit();
+        c.begin_edit(&HashMap::new());
         for ch in "abc".chars() {
             c.insert_char(ch);
         }
@@ -1013,7 +1245,7 @@ mod tests {
         c.submit();
         assert_eq!(c.resolved(), Some(("NAME", "abXc")));
 
-        c.begin_edit(); // re-edit seeds from prior answer, cursor at end
+        c.begin_edit(&HashMap::new()); // re-edit seeds from prior answer, cursor at end
         c.backspace();
         c.submit();
         assert_eq!(c.resolved(), Some(("NAME", "abX")));
@@ -1035,7 +1267,7 @@ mod tests {
     #[test]
     fn select_moves_and_clamps() {
         let mut c = select();
-        c.begin_edit();
+        c.begin_edit(&HashMap::new());
         c.select_move(false); // already at 0, stays
         c.select_move(true); // -> 1
         c.select_move(true); // -> 2
@@ -1047,12 +1279,12 @@ mod tests {
     #[test]
     fn cancel_restores_prior_answer() {
         let mut c = text();
-        c.begin_edit();
+        c.begin_edit(&HashMap::new());
         c.insert_char('z');
         c.submit();
         assert_eq!(c.resolved(), Some(("NAME", "z")));
 
-        c.begin_edit();
+        c.begin_edit(&HashMap::new());
         c.insert_char('!'); // editing "z!"
         c.cancel(); // discard edit, restore "z"
         assert_eq!(c.resolved(), Some(("NAME", "z")));
@@ -1062,7 +1294,7 @@ mod tests {
     #[test]
     fn cancel_from_pending_returns_to_pending() {
         let mut c = confirm();
-        c.begin_edit();
+        c.begin_edit(&HashMap::new());
         c.cancel();
         assert!(matches!(c.state, InputState::Pending));
     }
@@ -1070,12 +1302,12 @@ mod tests {
     #[test]
     fn select_re_edit_seeds_from_answer() {
         let mut c = select();
-        c.begin_edit();
+        c.begin_edit(&HashMap::new());
         c.select_move(true); // -> "b"
         c.submit();
         assert_eq!(c.resolved(), Some(("CHOICE", "b")));
 
-        c.begin_edit(); // should seed index at "b" (1)
+        c.begin_edit(&HashMap::new()); // should seed index at "b" (1)
         match &c.state {
             InputState::Editing {
                 draft: Draft::Select(i),
@@ -1155,7 +1387,7 @@ mod tests {
 
         // Answer the input and drive the code cell through a finished run.
         let cell = rb.input_at_mut(0).unwrap();
-        cell.begin_edit();
+        cell.begin_edit(&HashMap::new());
         cell.insert_char('z');
         cell.submit();
         if let BookBlock::Code(c) = &mut rb.blocks[1] {
@@ -1195,7 +1427,7 @@ mod tests {
         // Input blocks are not copyable, answered or not.
         assert_eq!(rb.copy_text(2), None);
         let cell = rb.input_at_mut(2).unwrap();
-        cell.begin_edit();
+        cell.begin_edit(&HashMap::new());
         cell.insert_char('z');
         cell.submit();
         assert_eq!(rb.copy_text(2), None);
@@ -1261,7 +1493,7 @@ mod tests {
 
         // Answer the input cell (block 0).
         let cell = rb.input_at_mut(0).unwrap();
-        cell.begin_edit();
+        cell.begin_edit(&HashMap::new());
         cell.insert_char('z');
         cell.submit();
 

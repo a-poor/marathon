@@ -2,7 +2,7 @@
 title: Prompting for input
 description: A json mrthn=input cell collects a choice and exports it to later cells via `target`.
 env:
-  BASE: "https://example.test"
+  BASE: "https://jsonplaceholder.typicode.com"
 ---
 
 # Prompting for input
@@ -16,7 +16,7 @@ tools it's just highlighted JSON; to marathon it's a prompt.
 First, produce a list of choices and stash it under `$TMP_DIR`.
 
 ```sh
-curl -s "$BASE/api/options" > "$TMP_DIR/choices.txt"
+curl -s $BASE/users | jq -r '.[].username' > "$TMP_DIR/choices.txt"
 cat "$TMP_DIR/choices.txt"
 ```
 
@@ -66,7 +66,7 @@ A `confirm` cell is a yes/no gate. The answer (`yes`/`no`) lands in `target`
 ```sh
 echo "You picked: $CHOICE (labeled '$LABEL')"
 if [ "$PROCEED" = "yes" ]; then
-  curl -s -X POST "$BASE/api/order/$CHOICE"
+  curl -s "$BASE/api/order/$CHOICE"
 else
   echo "Skipped — PROCEED was '$PROCEED'."
 fi
