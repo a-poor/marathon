@@ -41,6 +41,22 @@ archives:
       - goos: windows
         formats: [zip]
 
+homebrew_casks:
+  - name: marathon
+    repository:
+      owner: a-poor
+      name: homebrew-tap
+    homepage: "https://github.com/a-poor/marathon"
+    description: "CLI/TUI for viewing, managing, and running markdown runbooks"
+    # Binaries aren't notarized, so strip the Gatekeeper quarantine flag on
+    # install — otherwise macOS blocks the binary with a "cannot be opened" error.
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/marathon"]
+          end
+
 changelog:
   sort: asc
   filters:

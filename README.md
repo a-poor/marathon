@@ -10,11 +10,19 @@ It's all just markdown! But marathon lets you run your code blocks.
 
 ## Installing
 
-Right now you can either clone the repo locally and install it or you can install from GitHub:
+On mac, you can install `marathon` with Homebrew:
+
+```sh
+brew install a-poor/tap/marathon
+```
+
+You can also install it with cargo:
 
 ```sh
 cargo install --git https://github.com/a-poor/marathon
 ```
+
+Or you can download a pre-compiled binary from the [releases](https://github.com/a-poor/marathon/releases).
 
 ## Writing Runbooks
 
