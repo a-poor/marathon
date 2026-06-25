@@ -57,7 +57,7 @@
 #   ScrollUp[@<time>] [number]      Scroll terminal viewport up by rows
 #   ScrollDown[@<time>] [number]    Scroll terminal viewport down by rows
 
-Output demo.gif
+Output assets/demo.gif
 
 Require marathon
 
@@ -87,10 +87,12 @@ Type "marathon run samples/demo.md" Sleep 50ms Enter
 Sleep 2s
 
 # Go to the first runnable cell
-Down
-Down
-Down
-Down
+Down@400ms 12
+Up@100ms 8
+# Down
+# Down
+# Down
+# Down
 Sleep 1s
 
 # Run it
