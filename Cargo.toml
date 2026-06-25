@@ -2,6 +2,13 @@
 name = "marathon"
 version = "0.1.0"
 edition = "2024"
+description = "A CLI/TUI for viewing, managing, and running markdown runbooks"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/a-poor/marathon"
+readme = "README.md"
+keywords = ["runbook", "markdown", "tui", "cli", "automation"]
+categories = ["command-line-utilities"]
+rust-version = "1.85"
 
 [dependencies]
 anyhow = "1.0.102"
