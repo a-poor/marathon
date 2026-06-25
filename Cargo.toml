@@ -8,7 +8,7 @@ repository = "https://github.com/a-poor/marathon"
 readme = "README.md"
 keywords = ["runbook", "markdown", "tui", "cli", "automation"]
 categories = ["command-line-utilities"]
-rust-version = "1.85"
+rust-version = "1.88.0"
 
 [dependencies]
 anyhow = "1.0.102"
