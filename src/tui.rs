@@ -38,7 +38,7 @@ pub struct App {
     mode: Mode,
     /// Whether the hotkeys help modal is open (overlays any mode).
     show_help: bool,
-    /// Whether cell outputs are expanded to full length (vs. the truncated tail).
+    /// Whether cell outputs show bounded pages instead of the live tail.
     verbose: bool,
     /// Bumped whenever block contents change (e.g. a cell runs), to invalidate
     /// the document's wrapped-line cache.
@@ -294,6 +294,8 @@ impl App {
                 self.verbose = !self.verbose;
                 self.revision += 1;
             }
+            (KeyCode::Char('['), _) => self.page_output(false),
+            (KeyCode::Char(']'), _) => self.page_output(true),
             (KeyCode::Char('Y'), _) => self.copy_output_selected(),
             (KeyCode::Char('x'), _) => self.clear_selected(),
             (KeyCode::Char('X'), _) => self.clear_all(),
@@ -353,14 +355,50 @@ impl App {
     /// `Y` (Shift-y): copy the selected code cell's captured output (stdout+stderr) to
     /// the system clipboard. A no-op for markdown/input cells or a cell with no output.
     fn copy_output_selected(&mut self) {
+        if self.clipboard.is_none() {
+            return;
+        }
         let Some(idx) = self.selected_block() else {
             return;
         };
-        let Some(text) = self.book.output_text(idx) else {
+        match self.book.output_text(idx) {
+            Ok(Some(text)) => self.copy_to_clipboard(text, "copied output"),
+            Ok(None) => {}
+            Err(e) => self.set_output_error(idx, format!("copying output: {e}")),
+        }
+    }
+
+    fn page_output(&mut self, forward: bool) {
+        if !self.verbose {
+            return;
+        }
+        let Some(idx) = self.selected_block() else {
             return;
         };
-        // Copy the cleaned output (no ANSI/control litter), matching what's shown.
-        self.copy_to_clipboard(crate::ansi::sanitize(&text), "copied output");
+        let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) else {
+            return;
+        };
+        match c.output.window(c.output_page, true) {
+            Ok(window) => {
+                let last = window.total.saturating_sub(1) / crate::output::PAGE_BYTES;
+                let page = c.output_page.unwrap_or(last).min(last);
+                c.output_page = if forward {
+                    (page + 1 < last).then_some(page + 1)
+                } else {
+                    Some(page.saturating_sub(1))
+                };
+                self.scroll.reveal_selected();
+                self.revision += 1;
+            }
+            Err(e) => self.set_output_error(idx, format!("reading output: {e}")),
+        }
+    }
+
+    fn set_output_error(&mut self, idx: usize, msg: String) {
+        if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
+            c.error = Some(msg);
+        }
+        self.revision += 1;
     }
 
     /// Place `text` on the system clipboard, flashing `label` on success. A no-op when
@@ -464,13 +502,22 @@ impl App {
         env.entry("NO_COLOR".to_string())
             .or_insert_with(|| "1".to_string());
 
+        let capture = match crate::output::OutputCapture::create() {
+            Ok(capture) => capture,
+            Err(e) => {
+                self.set_cell_error(idx, format!("creating output spool: {e}"));
+                return false;
+            }
+        };
         if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
             c.begin_run();
+            c.output = capture.clone();
         }
         self.book.last_run = Some(idx);
         self.revision += 1;
 
-        let run = runner::spawn_run(idx, interp, script, env, self.run_tx.clone());
+        let run =
+            runner::spawn_captured_run(idx, interp, script, env, self.run_tx.clone(), capture);
         self.runs.insert(idx, run);
         true
     }
@@ -506,7 +553,8 @@ impl App {
 
     fn set_cell_error(&mut self, idx: usize, msg: String) {
         if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
-            c.output = msg.into_bytes();
+            c.clear();
+            c.error = Some(msg);
             c.state = CodeBlockState::Error;
         }
         self.revision += 1;
@@ -515,11 +563,12 @@ impl App {
     /// Fold a streamed run message back into the document.
     fn apply_run_msg(&mut self, msg: RunMsg) {
         match msg {
-            RunMsg::Output { idx, chunk } => {
-                if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
-                    c.push_output(&chunk);
+            RunMsg::Captured { idx } => {
+                if !self.runs.contains_key(&idx) {
+                    return;
                 }
             }
+            RunMsg::Output { .. } => unreachable!("TUI output is spooled by the runner"),
             RunMsg::Finished {
                 idx,
                 success,
@@ -528,7 +577,7 @@ impl App {
             } => {
                 if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
                     if let Some(error) = error {
-                        c.push_output(format!("\nfailed to run: {error}\n"));
+                        c.error = Some(format!("failed to run: {error}"));
                     }
                     c.finish(success, code);
                 }
@@ -665,7 +714,7 @@ mod tests {
         while !app.runs.is_empty() {
             next(&mut app).await;
         }
-        assert_eq!(app.book.output_text(5).as_deref(), Some("A"));
+        assert_eq!(app.book.output_text(5).unwrap().as_deref(), Some("A"));
         app.shutdown_runs().await;
     }
 
@@ -822,7 +871,7 @@ mod tests {
             while !app.runs.is_empty() {
                 next(&mut app).await;
             }
-            assert_eq!(app.book.output_text(0).as_deref(), Some("done"));
+            assert_eq!(app.book.output_text(0).unwrap().as_deref(), Some("done"));
             assert_eq!(app.book.run_counts().succeeded, 1);
         }
         app.shutdown_runs().await;
@@ -873,5 +922,116 @@ mod tests {
         )));
         assert!(app.exit);
         app.shutdown_runs().await;
+    }
+
+    fn capture(app: &App) -> crate::output::OutputCapture {
+        let BookBlock::Code(c) = &app.book.blocks[0] else {
+            panic!("code");
+        };
+        c.output.clone()
+    }
+
+    #[tokio::test]
+    async fn large_output_is_paged_and_spools_are_removed_on_rerun_clear_and_reset() {
+        let mut app = app("awk 'BEGIN { for(i=0;i<20000;i++) print i }'");
+        let mut previous = Vec::<std::path::PathBuf>::new();
+        for _ in 0..2 {
+            app.activate_or_run();
+            assert!(previous.iter().all(|p| !p.exists()));
+            while !app.runs.is_empty() {
+                next(&mut app).await;
+            }
+            let output = capture(&app);
+            previous = output.paths();
+            assert!(previous.iter().all(|p| p.exists()));
+            assert!(
+                output
+                    .window(None, false)
+                    .unwrap()
+                    .text
+                    .ends_with("19999\n")
+            );
+            assert!(output.window(None, true).unwrap().start > 0);
+            app.verbose = true;
+            while !matches!(&app.book.blocks[0], BookBlock::Code(c) if c.output_page == Some(0)) {
+                app.page_output(false);
+            }
+            let BookBlock::Code(c) = &app.book.blocks[0] else {
+                panic!();
+            };
+            assert!(
+                c.output
+                    .window(c.output_page, true)
+                    .unwrap()
+                    .text
+                    .starts_with("0\n")
+            );
+            assert_eq!(
+                app.book.output_text(0).unwrap().unwrap().lines().count(),
+                20000
+            );
+        }
+        app.clear_selected();
+        assert!(previous.iter().all(|p| !p.exists()));
+        app.activate_or_run();
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        let paths = capture(&app).paths();
+        app.clear_all();
+        assert!(paths.iter().all(|p| !p.exists()));
+        app.shutdown_runs().await;
+    }
+
+    #[tokio::test]
+    async fn spool_write_failure_stops_run_and_keeps_diagnostic_out_of_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let release = dir.path().join("release");
+        let mut app = app(
+            "printf ready; while [ ! -e \"$RELEASE\" ]; do sleep 0.01; done; while :; do printf more; done",
+        );
+        app.book
+            .cli_env
+            .insert("RELEASE".into(), release.display().to_string());
+        app.activate_or_run();
+        next(&mut app).await;
+        let capture = capture(&app);
+        assert_eq!(capture.text().unwrap(), "ready");
+        capture.fail_writes();
+        std::fs::write(release, "go").unwrap();
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        let BookBlock::Code(c) = &app.book.blocks[0] else {
+            panic!();
+        };
+        assert_eq!(c.state, CodeBlockState::Error);
+        assert!(c.error.as_deref().unwrap().contains("writing output spool"));
+        assert_eq!(capture.window(None, false).unwrap().text, "ready");
+        assert!(app.book.output_text(0).is_err());
+        app.shutdown_runs().await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_partial_capture_until_clear_and_quit_cleans_up() {
+        let mut app = app("printf partial; sleep 10");
+        app.activate_or_run();
+        next(&mut app).await;
+        let paths = capture(&app).paths();
+        app.cancel_selected();
+        app.cancel_selected();
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        assert_eq!(app.book.output_text(0).unwrap().as_deref(), Some("partial"));
+        assert!(paths.iter().all(|p| p.exists()));
+        app.clear_selected();
+        assert!(paths.iter().all(|p| !p.exists()));
+        app.activate_or_run();
+        next(&mut app).await;
+        let paths = capture(&app).paths();
+        app.shutdown_runs().await;
+        drop(app);
+        assert!(paths.iter().all(|p| !p.exists()));
     }
 }

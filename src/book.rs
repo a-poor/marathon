@@ -341,15 +341,16 @@ impl Runbook {
         }
     }
 
-    /// The captured stdout+stderr of the code cell at `idx`, for copying its output.
+    /// The cleaned stdout+stderr of the code cell at `idx`, read on demand for copying.
     /// `None` if the index is out of range, the block isn't a code cell, or the cell
     /// has produced no output yet (nothing to copy).
-    pub fn output_text(&self, idx: usize) -> Option<String> {
-        match self.blocks.get(idx)? {
-            BookBlock::Code(c) if !c.output.is_empty() => {
-                Some(String::from_utf8_lossy(&c.output).into_owned())
-            }
-            _ => None,
+    pub fn output_text(&self, idx: usize) -> std::io::Result<Option<String>> {
+        match self.blocks.get(idx) {
+            Some(BookBlock::Code(c)) => c
+                .output
+                .text()
+                .map(|text| (!text.is_empty()).then_some(text)),
+            _ => Ok(None),
         }
     }
 
@@ -448,10 +449,12 @@ pub struct CodeBlock {
     pub content: String,
     /// Lifecycle status of the cell (idle / running / ok / error).
     pub state: CodeBlockState,
-    /// Combined stdout+stderr captured from the run, accumulated as it streams in.
-    /// Kept separate from `state` because output changes far more frequently.
-    /// Decode only at display/copy boundaries so split UTF-8 remains intact.
-    pub output: Vec<u8>,
+    /// Disk-backed raw and cleaned output, owned by this run.
+    pub output: crate::output::OutputCapture,
+    /// Persistent Marathon diagnostic, separate from command output.
+    pub error: Option<String>,
+    /// Expanded output page; None follows the latest page.
+    pub output_page: Option<u64>,
     /// When the current run began. Set in [`CodeBlock::begin_run`], used to compute
     /// [`CodeBlock::elapsed`] on finish. A live ticking timer is the footer's job
     /// (it redraws every frame); this only yields the final duration.
@@ -488,7 +491,9 @@ impl CodeBlock {
 
     /// Reset for a fresh run: clear prior output, start the clock, mark it running.
     pub fn begin_run(&mut self) {
-        self.output.clear();
+        self.output = crate::output::OutputCapture::default();
+        self.error = None;
+        self.output_page = None;
         self.started_at = Some(std::time::Instant::now());
         self.elapsed = None;
         self.exit_code = None;
@@ -497,8 +502,8 @@ impl CodeBlock {
     }
 
     /// Append a streamed output chunk.
-    pub fn push_output(&mut self, chunk: impl AsRef<[u8]>) {
-        self.output.extend_from_slice(chunk.as_ref());
+    pub fn push_output(&mut self, chunk: impl AsRef<[u8]>) -> std::io::Result<()> {
+        self.output.append(chunk.as_ref())
     }
 
     /// Mark the run finished, recording how long it ran and its exit code.
@@ -514,7 +519,9 @@ impl CodeBlock {
 
     /// Discard any prior run: clear captured output and return to the un-run state.
     pub fn clear(&mut self) {
-        self.output.clear();
+        self.output = crate::output::OutputCapture::default();
+        self.error = None;
+        self.output_page = None;
         self.started_at = None;
         self.elapsed = None;
         self.exit_code = None;
@@ -541,7 +548,9 @@ impl TryFrom<markdown::mdast::Code> for CodeBlock {
             content: val.value,
             meta,
             state: CodeBlockState::NotRun,
-            output: Vec::new(),
+            output: crate::output::OutputCapture::default(),
+            error: None,
+            output_page: None,
             started_at: None,
             elapsed: None,
             exit_code: None,
@@ -1509,9 +1518,9 @@ env:
         let BookBlock::Code(cell) = &mut book.blocks[0] else {
             panic!("code");
         };
-        cell.push_output([0xe2]);
-        cell.push_output([0x82, 0xac, 0xff]);
-        assert_eq!(book.output_text(0).as_deref(), Some("€�"));
+        cell.push_output([0xe2]).unwrap();
+        cell.push_output([0x82, 0xac, 0xff]).unwrap();
+        assert_eq!(book.output_text(0).unwrap().as_deref(), Some("€�"));
     }
 
     #[test]
@@ -1769,7 +1778,9 @@ env:
             },
             content: String::new(),
             state: CodeBlockState::NotRun,
-            output: Vec::new(),
+            output: crate::output::OutputCapture::default(),
+            error: None,
+            output_page: None,
             started_at: None,
             elapsed: None,
             exit_code: None,
@@ -1832,7 +1843,7 @@ env:
         cell.submit().unwrap();
         if let BookBlock::Code(c) = &mut rb.blocks[1] {
             c.begin_run();
-            c.push_output("out\n");
+            c.push_output("out\n").unwrap();
             c.finish(false, Some(2));
         }
         rb.last_run = Some(1);

@@ -171,6 +171,14 @@ cell and reference `$target` downstream.
 - `marathon new <file>` — scaffold a minimal runbook.
 - `-e/--env KEY=VAL` (on `run`/`exec`, repeatable) — inject env vars.
 
+TUI output is spooled to temporary disk captures. The live tail shows up to 25
+lines within 16 KiB; Ctrl-O expands to pages and `[` / `]` browse the selected
+cell's earlier/later pages. `Y` copies the full cleaned output on demand. Captures
+are removed on rerun, clear/reset, and quit, independently of `$TMP_DIR` settings.
+Disk failures are reported on the cell; write failures stop its command. Use shell
+redirection or `marathon exec ... > run.log` when output must survive the session.
+CLI output remains byte-preserving and streaming.
+
 When editing a runbook, you can sanity-check it with `marathon validate <file>`.
 
 ## Authoring checklist

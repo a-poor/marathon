@@ -4,24 +4,12 @@ Current behavior is documented in [README.md](README.md) and [DESIGN.md](DESIGN.
 
 ## Priority workstreams
 
-The next priorities, in order, are output spooling, execution controls, and release
-checks. Each is a separate workstream; output and execution work share parts of
-`book.rs` and `tui.rs`, so coordinate model/API changes when working in parallel.
-Keep runbooks ordinary Markdown and update the README, design, samples, and
-bundled authoring skill when behavior changes.
+The next priorities, in order, are execution controls and release checks. Keep
+runbooks ordinary Markdown and update the README, design, samples, and bundled
+authoring skill when behavior changes. Coordinate model/API changes to `book.rs`
+and `tui.rs` when working in parallel.
 
-### 1. Output spooling and bounded memory
-
-- Bound in-memory TUI output and spool full output to disk. Queued runner chunks
-  are bounded today, but accumulated cell output grows without a limit; the
-  25-line display tail does not bound memory use.
-- Preserve access to full output for expansion/copying without loading or
-  sanitizing the entire capture on every update. Define spool ownership, cleanup
-  on rerun/reset/quit, and how disk/write failures are surfaced.
-- Keep CLI output byte-preserving and streaming. Verify large-output behavior,
-  partial lines, split UTF-8, cancellation, and spool cleanup with local tests.
-
-### 2. Execution controls and recovery
+### 1. Execution controls and recovery
 
 - Add CLI cell/range selection and a way to start at a chosen cell, so recovering
   from a late failure does not require replaying every earlier command. Define
@@ -38,7 +26,7 @@ bundled authoring skill when behavior changes.
 - Cover partial-run input resolution, sequential execution, failure/cancellation,
   and existing active-run/reset/cleanup invariants with regression tests.
 
-### 3. Release checks
+### 2. Release checks
 
 - Add platform build/release smoke checks around the existing GoReleaser
   configuration.
@@ -102,3 +90,7 @@ bundled authoring skill when behavior changes.
   cleanup on quit, terminal errors, signals, and broken output pipes.
 - Inline status gutters, elapsed time/exit codes, footer progress, clipboard,
   25-line output tails, and Ctrl-O expansion.
+- Per-run raw/cleaned output spools, incremental display decoding, bounded 16 KiB
+  windows/pages, full-output copying on demand, disk-failure diagnostics, and
+  spool cleanup on rerun/reset/quit. Large-output, split-UTF-8, partial-line,
+  cancellation, write-failure, and cleanup regression coverage.
