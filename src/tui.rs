@@ -302,16 +302,37 @@ impl App {
         }
     }
 
-    /// Enter on the selected cell: edit it if it's an input cell, run it if it's a
-    /// runnable code cell, otherwise nothing.
+    /// Enter edits an input in place, or starts code and advances to the next
+    /// actionable cell. Merely selecting the next cell does not activate it.
     fn activate_or_run(&mut self) {
         let Some(idx) = self.selected_block() else {
             return; // header selected: nothing to activate
         };
-        match self.book.blocks.get(idx) {
-            Some(BookBlock::Input(_)) => self.activate_selected(),
+        let started = match self.book.blocks.get(idx) {
+            Some(BookBlock::Input(_)) => {
+                self.activate_selected();
+                false
+            }
             Some(BookBlock::Code(c)) if c.is_runnable() => self.run_selected(idx),
-            _ => {}
+            _ => false,
+        };
+        if started {
+            self.select_next_cell(idx);
+        }
+    }
+
+    /// Skip prose and display-only code, staying put at the end of the runbook.
+    fn select_next_cell(&mut self, idx: usize) {
+        let next =
+            self.book.blocks.iter().enumerate().skip(idx + 1).find_map(
+                |(idx, block)| match block {
+                    BookBlock::Input(_) => Some(idx),
+                    BookBlock::Code(cell) if cell.is_runnable() => Some(idx),
+                    _ => None,
+                },
+            );
+        if let Some(next) = next {
+            self.scroll.select_index(next + 1, self.selectable_count());
         }
     }
 
@@ -413,14 +434,15 @@ impl App {
 
     /// Spawn the code cell at `idx`: mark it Running now, build its interpreter +
     /// script + env, and run it off-thread; the result returns via `run_rx`.
-    fn run_selected(&mut self, idx: usize) {
+    /// Return whether a new run was scheduled, so rejected runs do not advance.
+    fn run_selected(&mut self, idx: usize) -> bool {
         if self.runs.contains_key(&idx) {
-            return;
+            return false;
         }
         // TMP_DIR must exist before we build the env map that references it.
         if let Err(e) = self.book.ensure_tmp_dir() {
             self.set_cell_error(idx, format!("tmp dir: {e}"));
-            return;
+            return false;
         }
 
         let (interp, script, mut env) = match self.book.blocks.get(idx) {
@@ -429,7 +451,7 @@ impl App {
                 self.book.script_for(c),
                 self.book.env_for(idx),
             ),
-            _ => return,
+            _ => return false,
         };
 
         // TUI runs are color-off (we strip SGR on display anyway): hint tools to
@@ -447,6 +469,7 @@ impl App {
 
         let run = runner::spawn_run(idx, interp, script, env, self.run_tx.clone());
         self.runs.insert(idx, run);
+        true
     }
 
     /// Backspace: escalate a cancellation of the selected cell's run, if it's running.
@@ -518,7 +541,7 @@ impl App {
     }
 
     /// Active-mode keys: route into the focused input cell's draft. Esc cancels,
-    /// Enter submits; everything else is dispatched by cell kind.
+    /// Enter submits and advances; everything else is dispatched by cell kind.
     fn handle_active_key(&mut self, key: KeyEvent) {
         let Some(idx) = self.selected_block() else {
             self.mode = Mode::Navigate;
@@ -538,6 +561,7 @@ impl App {
             KeyCode::Enter => {
                 cell.submit();
                 self.mode = Mode::Navigate;
+                self.select_next_cell(idx);
             }
             code => match &cell.config {
                 MagicInputBlock::Confirm { .. } => match code {
@@ -590,6 +614,108 @@ mod tests {
             .unwrap()
             .unwrap();
         app.apply_run_msg(msg);
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    #[tokio::test]
+    async fn enter_runs_and_advances_through_actionable_cells() {
+        let doc = "```sh\nprintf first\n```\n\nProse\n\n\
+                   ```sh skip=true\necho skipped\n```\n\n\
+                   ```python\nprint('display only')\n```\n\n\
+                   ```json mrthn=input\n\
+                   {\"type\":\"input\",\"prompt\":\"Name?\",\"target\":\"NAME\"}\n\
+                   ```\n\n```sh\nprintf '%s' \"$NAME\"\n```\n\nThe end.\n";
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        app.scroll.select_index(1, app.selectable_count());
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.selected_block(), Some(4));
+        assert_eq!(app.mode, Mode::Navigate);
+        assert_eq!(app.runs.len(), 1);
+        assert!(!app.book.input_at_mut(4).unwrap().is_editing());
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        // Completion leaves the next cell selected without running it.
+        assert_eq!(app.selected_block(), Some(4));
+        assert_eq!(app.book.run_counts().succeeded, 1);
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.selected_block(), Some(4));
+        assert_eq!(app.mode, Mode::Active);
+        press(&mut app, KeyCode::Char('A'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.selected_block(), Some(5));
+        assert_eq!(app.mode, Mode::Navigate);
+        assert!(app.runs.is_empty());
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.selected_block(),
+            Some(5),
+            "do not move to trailing prose"
+        );
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        assert_eq!(app.book.output_text(5).as_deref(), Some("A"));
+        app.shutdown_runs().await;
+    }
+
+    #[test]
+    fn input_cancel_stays_put_and_final_input_does_not_wrap() {
+        let doc = "```json mrthn=input\n\
+                   {\"type\":\"confirm\",\"prompt\":\"Proceed?\",\"target\":\"OK\"}\n\
+                   ```\n\nThe end.\n";
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        app.scroll.select_index(1, app.selectable_count());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.selected_block(), Some(0));
+        assert!(app.book.input_at_mut(0).unwrap().resolved().is_none());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.selected_block(), Some(0));
+        assert_eq!(app.mode, Mode::Navigate);
+        assert_eq!(
+            app.book.input_at_mut(0).unwrap().resolved(),
+            Some(("OK", "no"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_rerun_does_not_advance() {
+        let doc = "```sh\nsleep 10\n```\n\n```sh\nprintf second\n```";
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        app.scroll.select_index(1, app.selectable_count());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.selected_block(), Some(1));
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.selected_block(), Some(0));
+        assert_eq!(app.runs.len(), 1);
+        app.shutdown_runs().await;
+    }
+
+    #[test]
+    fn failed_run_setup_does_not_advance() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, "occupied").unwrap();
+        let doc = "```sh\nprintf first\n```\n\n```sh\nprintf second\n```";
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        app.book.frontmatter.tmp_dir = Some(crate::book::TmpDirConf {
+            path: Some(file),
+            ..Default::default()
+        });
+        app.scroll.select_index(1, app.selectable_count());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.selected_block(), Some(0));
+        assert!(app.runs.is_empty());
+        assert_eq!(app.book.run_counts().errored, 1);
     }
 
     #[tokio::test]

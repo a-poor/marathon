@@ -23,7 +23,7 @@ const SECTIONS: &[Section] = &[
             ("j / k   ↓ / ↑", "move selection"),
             ("g / G", "first / last cell"),
             ("Ctrl-d / Ctrl-u", "half-page down / up"),
-            ("Enter", "run cell · edit input"),
+            ("Enter", "run & advance · edit input"),
             ("Backspace", "cancel run (×2 to kill)"),
             ("Ctrl-o", "expand / collapse output"),
             ("y", "copy cell to clipboard"),
@@ -36,7 +36,7 @@ const SECTIONS: &[Section] = &[
     Section {
         heading: "Editing an input",
         rows: &[
-            ("Enter", "submit"),
+            ("Enter", "submit & advance"),
             ("Esc", "cancel"),
             ("← / →   y / n   ▲ / ▼", "adjust value"),
         ],

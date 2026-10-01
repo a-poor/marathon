@@ -142,7 +142,10 @@ cell and reference `$target` downstream.
 ## The CLI
 
 - `marathon run <file>` — interactive TUI, step through cell by cell (the safe
-  default; you confirm each cell).
+  default; you confirm each cell). Enter starts code and selects the next runnable
+  or input cell, skipping prose/display-only blocks. Input editing stays focused
+  until submission, which also advances. The next cell does not run automatically;
+  the final actionable cell stays selected.
 - `marathon exec <file>` — sequential execution with confirmation before each
   shell cell and prompts for input. No/blank cell confirmation stops the run;
   EOF is an error. Prompts/diagnostics go to stderr; raw command bytes go to stdout.

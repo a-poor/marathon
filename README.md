@@ -32,7 +32,8 @@ marathon validate hello.md
 marathon run hello.md
 ```
 
-In the TUI, select a cell with the arrow keys and press Enter to run it.
+In the TUI, select a cell with the arrow keys and press Enter to run it and select
+the next runnable or input cell. Input cells advance after you submit an answer.
 For sequential execution without the TUI:
 
 ```sh
@@ -183,7 +184,7 @@ that require an interactive terminal are not supported by the current runner.
 | `↑` / `↓`, `k` / `j` | Move selection |
 | `g` / `G`, Home / End | First / last cell |
 | Ctrl-U / Ctrl-D, Page Up / Page Down | Scroll half a page |
-| Enter | Run selected code or edit/submit an input |
+| Enter | Run code and advance; edit an input in place, then submit and advance |
 | Backspace | Interrupt selected run; press again to force-kill it |
 | Ctrl-O | Expand/collapse output beyond the last 25 lines |
 | `y` / `Y` | Copy cell source / cleaned output |
@@ -191,6 +192,11 @@ that require an interactive terminal are not supported by the current runner.
 | `?` | Show help |
 | `q` / Esc | Quit navigation; Esc cancels an input edit or closes help |
 | Ctrl-C | Quit from any mode |
+
+Advancement skips prose and display-only code and stays on the last actionable
+cell at the end. It happens when a run starts, without waiting for completion or
+automatically running the next cell. Use the arrow keys to return to running output
+or cancel it with Backspace. Canceling an input edit leaves that input selected.
 
 A running cell cannot be started again or cleared. Reset-all is blocked while any
 cell is running. Different cells may run concurrently; the TUI does not enforce

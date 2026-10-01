@@ -76,6 +76,12 @@ TUI stores one owner per block index; a block cannot restart or clear until its
 finished message is consumed. Reset-all is blocked while any run exists.
 Different blocks can execute concurrently in the TUI.
 
+Enter starts the selected code cell and immediately selects the next runnable or
+input cell, skipping prose and display-only code. It does not start that next cell.
+Opening an input editor keeps focus in place; submitting advances, while canceling
+stays put. The last actionable cell remains selected (no wrapping). Rejected starts
+do not advance, and asynchronous completion never changes selection.
+
 On Unix each cell leads a new process group. Backspace requests SIGINT; a second
 press requests SIGKILL. A stop requested before spawn is retained. Quit, terminal
 errors, CLI interruption, and output failures force cleanup and await the task
