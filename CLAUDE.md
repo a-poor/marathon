@@ -10,56 +10,53 @@ A core design constraint is **maximum compatibility with other markdown tools**:
 runbook must remain a valid, ordinary markdown file. Marathon-specific behavior is
 layered on top of standard markdown rather than introducing custom syntax.
 
-This is an early-stage scaffold. Most modules (`term.rs`, `tui.rs`) are empty, and
-`widget_markdown.rs` is a `todo!()` skeleton. Expect to implement, not just extend.
-
-**Read `DESIGN.md` first.** It is the authoritative design for the MVP — the cell
-model, the layering of config (frontmatter → info-string `key=value` → special
-`json mrthn=...` blocks), the env/state model, the CLI surface, and what is
-deliberately deferred. This `CLAUDE.md` only summarizes; `DESIGN.md` decides.
+This is a working MVP. The CLI, TUI, process runner, input cells, and rendering
+are implemented. Read `DESIGN.md` for implementation contracts, `README.md` for
+user-facing behavior, and `TODO.md` for remaining work.
 
 ## Commands
 
 ```sh
-cargo run -- <args>      # run the CLI
-cargo build              # build
-cargo test               # run all tests
-cargo test <name>        # run a single test by name substring
-cargo clippy             # lint
-cargo fmt                # format
+cargo run -- <args>
+cargo test --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo fmt --all -- --check
+cargo +1.88.0 check --all-targets --locked
 ```
 
-Note: edition is **2024**, which requires a recent stable toolchain.
+The project uses Rust edition 2024 with MSRV 1.88.0.
 
 ## Architecture
 
-Entry point is `main.rs`, which parses `cli::App` (clap derive) and runs under a
-`#[tokio::main]` async runtime. Library code lives behind `lib.rs` (crate
-`marathon`); `main.rs` is a thin binary over it.
-
-Module responsibilities:
-- `cli.rs` — clap argument parsing (`App`). The top-level command surface.
-- `book.rs` — the runbook data model. `BookFrontmatter` is YAML frontmatter
-  (parsed with `serde_yaml`); `CodeBlockMeta` is per-code-block config parsed from
-  a code block's info string via `serde-kv` (e.g. controlling whether a block is
-  runnable via `skip`).
-- `widget_markdown.rs` — renders a parsed markdown AST. The `markdown` crate
-  produces an `mdast::Node` tree; `render_md_node` matches over every node variant.
-  This is the rendering core that ties parsing to display.
-- `term.rs` / `tui.rs` — terminal and TUI layers (ratatui + ratatui-textarea +
-  crossterm), currently unimplemented.
-
-Data flow (intended): markdown file → `markdown` crate parses to `mdast` →
-frontmatter + per-block `CodeBlockMeta` extracted into the `book` model →
-`widget_markdown` renders the tree → TUI (`tui`/`term`) drives interaction and
-executes non-skipped code blocks.
+- `main.rs` / `cli.rs`: command dispatch and clap arguments.
+- `book.rs`: Markdown/YAML parsing, cells, input state, environment layers, scratch
+  directories. YAML frontmatter is optional. Only explicitly labeled shell cells run.
+- `runner.rs`: owned process tasks, byte chunks over bounded channels, process-group
+  cancellation, cleanup, and completion/error messages.
+- `exec.rs`: sequential execution, prompts on stderr, raw stdout, input resolution,
+  fail-fast exit status and interruption cleanup.
+- `tui.rs`: asynchronous event loop, cell selection/editing, active run ownership,
+  clipboard, and shutdown cleanup.
+- `widgets/markdown.rs`, `wrap.rs`, `scrollview.rs`: Markdown rendering, wrapping,
+  cached layout and inline cell output. Other widgets supply footer/help chrome.
+- `term.rs`: shared signal handling.
+- `scaffold.rs` / `skills.rs`: starter template and embedded authoring guidance.
 
 ## Conventions
 
 - Errors propagate via `anyhow::Result`.
-- When working on the TUI, use the **ratatui** skill — the project pins ratatui
-  0.30, whose API differs significantly from pre-0.30 versions in training data.
-- Keep runbook files valid standalone markdown; do not invent non-standard syntax.
+- When working on the TUI, use `.claude/skills/ratatui/SKILL.md`; this project uses
+  Ratatui 0.30, whose API differs from older versions.
+- Keep runbooks valid standalone Markdown. Update the README, samples, design,
+  and `assets/skills/marathon/SKILL.md` when their format/behavior changes.
+- Keep command output as bytes until the display/text boundary. Runner failures
+  must not be written into command stdout.
+- Retain a `RunningCell` for every active command. On shutdown/error, await process
+  cleanup before dropping the runbook's scratch-directory guard.
+- Do not reset or rerun an active cell. Completion messages must belong to the
+  current run; preserve this invariant when changing event handling.
+- Use disposable directories and local commands in execution tests. Include CLI
+  binary tests for user-visible argument, output, input, and exit-status behavior.
 
 ## Git
 

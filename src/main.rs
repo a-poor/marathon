@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
 use marathon::book::{BookBlock, Runbook};
-use marathon::cli::{App, CompletionsCmd, ExecCmd, NewCmd, RunCmd, SkillsCmd, SkillsSub, ValidateCmd};
-use marathon::runner::RunMsg;
+use marathon::cli::{
+    App, CompletionsCmd, ExecCmd, NewCmd, RunCmd, SkillsCmd, SkillsSub, ValidateCmd,
+};
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::Path;
 
 #[tokio::main]
@@ -55,117 +55,13 @@ async fn run(cmd: RunCmd) -> Result<()> {
     result
 }
 
-/// `exec`: run the runbook headlessly, streaming each runnable cell's combined
-/// output to **stdout** while marathon's own progress chrome goes to **stderr** — so
-/// `marathon exec book.md > out.txt` captures exactly the cells' output and nothing
-/// else. Cells run straight through in document order (the `--yes` behavior; per-cell
-/// confirmation and interactive input prompting are deferred — DESIGN §5).
-///
-/// Output is raw: no sanitization and no forced `NO_COLOR`, unlike the TUI (DESIGN
-/// §7). Execution is fail-fast — the first cell to exit non-zero stops the run and
-/// `exec` exits with that cell's code (after cleaning up the temp dir), so CI sees a
-/// faithful status.
+/// Run sequentially, then propagate the command status after all cleanup.
 async fn exec(cmd: ExecCmd) -> Result<()> {
-    let mut rb = load(&cmd.path, cmd.common.env).await?;
-
-    // Materialize $TMP_DIR up front so the first cell already sees it, and so it's
-    // cleaned on drop (unless the runbook pins it / opts out of cleanup).
-    rb.ensure_tmp_dir().context("creating temp dir")?;
-
-    let total = rb
-        .blocks
-        .iter()
-        .filter(|b| matches!(b, BookBlock::Code(c) if c.is_runnable()))
-        .count();
-
-    let mut ran = 0usize;
-    let mut stdout = std::io::stdout();
-    let mut failure: Option<(String, Option<i32>)> = None;
-
-    for idx in 0..rb.blocks.len() {
-        // Resolve everything the run needs (owned) before awaiting, so no borrow of
-        // `rb` is held across the cell's execution.
-        let (interp, script, env, label) = match &rb.blocks[idx] {
-            BookBlock::Code(c) if c.is_runnable() => {
-                ran += 1;
-                let label = format!("cell {ran}/{total} ({})", c.lang);
-                (
-                    rb.interpreter_for(&c.lang),
-                    rb.script_for(c),
-                    rb.env_for(idx),
-                    label,
-                )
-            }
-            // Input cells can't be answered headlessly (no prompt, no default). They
-            // resolve from pre-provided env if the key is set, else stay unset — note
-            // which, since `set -eu` will fail a later cell that relies on it.
-            BookBlock::Input(cell) => {
-                let target = cell.target();
-                if rb.base_env().contains_key(target) {
-                    eprintln!(
-                        "› input '{target}' ({}) — using value from env",
-                        cell.kind()
-                    );
-                } else {
-                    eprintln!(
-                        "› input '{target}' ({}) — not set; pass -e {target}=… (downstream cells may fail)",
-                        cell.kind()
-                    );
-                }
-                continue;
-            }
-            _ => continue,
-        };
-
-        eprintln!("» {label}");
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let handle = tokio::spawn(marathon::runner::run_streaming(
-            idx, interp, script, env, tx,
-        ));
-
-        let mut success = false;
-        let mut code = None;
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                RunMsg::Output { chunk, .. } => {
-                    stdout
-                        .write_all(chunk.as_bytes())
-                        .and_then(|()| stdout.flush())
-                        .context("writing cell output")?;
-                }
-                RunMsg::Finished {
-                    success: s,
-                    code: c,
-                    ..
-                } => {
-                    success = s;
-                    code = c;
-                }
-                RunMsg::Started { .. } => {}
-            }
-        }
-        let _ = handle.await;
-
-        if !success {
-            failure = Some((label, code));
-            break;
-        }
-    }
-
-    if let Some((label, code)) = failure {
-        match code {
-            Some(c) => eprintln!("✗ {label} failed (exit {c})"),
-            None => eprintln!("✗ {label} failed (killed by signal)"),
-        }
-        // Drop the runbook first so its temp-dir guard runs — `process::exit` skips
-        // destructors — then exit with the cell's own code for a faithful CI status.
-        let code = code.unwrap_or(1);
-        drop(rb);
+    let book = load(&cmd.path, cmd.common.env).await?;
+    let code = marathon::exec::execute(book, cmd.yes).await?;
+    if code != 0 {
         std::process::exit(code);
     }
-
-    eprintln!("✓ ran {total} cell(s)");
     Ok(())
 }
 

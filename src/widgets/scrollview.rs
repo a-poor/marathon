@@ -579,23 +579,23 @@ fn gutter_color(state: CodeBlockState) -> Color {
     }
 }
 
-/// Maximum source lines of cell output shown inline. Fuller output (and a verbose
-/// toggle) is deferred polish — see TODO.md.
+/// Maximum source lines of cell output shown inline unless Ctrl-O expands it.
 const OUTPUT_MAX_LINES: usize = 25;
 
 /// Render a cell's captured output on the light dotted "result" gutter, dimmed.
 /// Shows the *tail* (last [`OUTPUT_MAX_LINES`] lines) so a streaming run reveals its
 /// latest output, with a "… N earlier lines" marker when there's more above. When
 /// `verbose` (Ctrl+O), the full output is shown with no truncation or marker.
-fn output_lines(output: &str, width: usize, verbose: bool) -> Vec<Line<'static>> {
+fn output_lines(output: impl AsRef<[u8]>, width: usize, verbose: bool) -> Vec<Line<'static>> {
+    let output = String::from_utf8_lossy(output.as_ref());
     if output.trim().is_empty() {
         return Vec::new();
     }
 
     // Sanitize at the TUI boundary: strip ANSI/control bytes ratatui would render
-    // literally and corrupt the display with (DESIGN §7). Output that was *only*
+    // literally and corrupt the display with (DESIGN §5). Output that was *only*
     // escapes is now empty.
-    let clean = crate::ansi::sanitize(output);
+    let clean = crate::ansi::sanitize(&output);
     if clean.trim().is_empty() {
         return Vec::new();
     }
@@ -1000,7 +1000,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
             unreachable!()
         };
         for i in 0..30 {
-            c.push_output(&format!("line {i}\n"));
+            c.push_output(format!("line {i}\n"));
         }
         term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 1), f.area(), &mut state))
             .unwrap();
@@ -1037,7 +1037,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
             panic!("expected a code cell");
         };
         for i in 0..30 {
-            c.push_output(&format!("line {i}\n"));
+            c.push_output(format!("line {i}\n"));
         }
         c.finish(true, Some(0));
         book.last_run = Some(0);
@@ -1064,7 +1064,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
         };
         c.state = CodeBlockState::Running;
         for i in 0..30 {
-            c.push_output(&format!("line {i}\n"));
+            c.push_output(format!("line {i}\n"));
         }
         book.last_run = Some(0);
 
@@ -1082,7 +1082,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
             unreachable!()
         };
         for i in 30..40 {
-            c.push_output(&format!("line {i}\n"));
+            c.push_output(format!("line {i}\n"));
         }
         term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 1), f.area(), &mut state))
             .unwrap();
@@ -1098,6 +1098,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
         InputCell::new(MagicInputBlock::Confirm {
             prompt: "Proceed?".into(),
             target: "OK".into(),
+            default: None,
         })
     }
 
@@ -1105,6 +1106,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
         InputCell::new(MagicInputBlock::Select {
             prompt: "Pick".into(),
             target: "CHOICE".into(),
+            default: None,
             options: Some(vec!["alpha".into(), "beta".into()]),
             option_file: None,
         })

@@ -1,88 +1,68 @@
 ---
 title: Prompting for input
-description: A json mrthn=input cell collects a choice and exports it to later cells via `target`.
-env:
-  BASE: "https://jsonplaceholder.typicode.com"
+description: Local example of generated options, text, and confirmation.
 ---
 
 # Prompting for input
 
-Sometimes a runbook needs a decision in the middle. Marathon expresses that with a
-**special block**: an ordinary `json` block tagged `mrthn=input`. To other markdown
-tools it's just highlighted JSON; to marathon it's a prompt.
+Run this with `marathon run samples/interactive.md` or
+`marathon exec samples/interactive.md`. To use the explicit defaults without any
+prompts, add `--yes` to `exec`.
 
-## Gather the options
+## Produce the options
 
-First, produce a list of choices and stash it under `$TMP_DIR`.
+A preceding cell can generate choices in the session's scratch directory:
 
 ```sh
-curl -s $BASE/users | jq -r '.[].username' > "$TMP_DIR/choices.txt"
-cat "$TMP_DIR/choices.txt"
+printf 'east\nwest\ncentral\n' > "$TMP_DIR/choices.txt"
 ```
 
-## Ask the user to pick one
-
-This block renders a selection prompt. The user's choice is written into the env map
-under the name given by `target` (`CHOICE`), so every cell *after* this one can use
-`$CHOICE`.
+## Choose a region
 
 ```json mrthn=input
 {
   "type": "select",
-  "prompt": "Which option do you want?",
-  "target": "CHOICE",
-  "option_file": "$TMP_DIR/choices.txt"
+  "prompt": "Which region?",
+  "target": "REGION",
+  "option_file": "$TMP_DIR/choices.txt",
+  "default": "west"
 }
 ```
 
-## Name the order
-
-A `text` cell collects free-form input. Whatever the user types is written to
-`target` (`LABEL`), so later cells can reference `$LABEL`.
+## Label the run
 
 ```json mrthn=input
 {
   "type": "input",
-  "prompt": "Give this order a label:",
-  "target": "LABEL"
+  "prompt": "Give this run a label:",
+  "target": "LABEL",
+  "default": "demo"
 }
 ```
 
-## Confirm before acting
+## Confirm the action
 
-A `confirm` cell is a yes/no gate. The answer (`yes`/`no`) lands in `target`
-(`PROCEED`), so a later cell can branch on it.
+`--yes` uses this block's `false` default; it does not turn the answer into yes.
+To override it for an unattended run, pass `--yes -e PROCEED=yes`.
 
 ```json mrthn=input
 {
   "type": "confirm",
-  "prompt": "Submit the order now?",
-  "target": "PROCEED"
+  "prompt": "Proceed?",
+  "target": "PROCEED",
+  "default": false
 }
 ```
 
-## Act on the choice
+## Use the answers
+
+A confirmation exports `yes`/`no`. The shell decides what that answer means:
 
 ```sh
-echo "You picked: $CHOICE (labeled '$LABEL')"
-if [ "$PROCEED" = "yes" ]; then
-  curl -s "$BASE/api/order/$CHOICE"
+printf 'Run %s in %s\n' "$LABEL" "$REGION"
+if [ "$PROCEED" = yes ]; then
+  echo "Proceeding with the example."
 else
-  echo "Skipped — PROCEED was '$PROCEED'."
+  echo "Skipped the example action."
 fi
 ```
-
----
-
-What about just a select option?
-
-```json mrthn=input
-{
-  "type": "select",
-  "prompt": "Which option do you want?",
-  "target": "CHOICE",
-  "options": ["foo","bar","baz"]
-}
-```
-
-The end.

@@ -1,6 +1,7 @@
 pub mod ansi;
 pub mod book;
 pub mod cli;
+pub mod exec;
 pub mod runner;
 pub mod scaffold;
 pub mod skills;

@@ -28,7 +28,7 @@ pub enum RootCmd {
     /// Run a runbook interactively in the TUI, cell by cell
     Run(RunCmd),
 
-    /// Run a runbook headlessly, streaming output to stdout (no TUI)
+    /// Run a runbook sequentially with prompts (use --yes for unattended execution)
     Exec(ExecCmd),
 
     /// Parse and check a runbook without running anything
@@ -87,7 +87,7 @@ pub struct CommonArgs {
     /// Set an environment variable for every cell (repeatable): `-e KEY=VAL`.
     ///
     /// Layered over the runbook's frontmatter `env` (CLI wins), beneath per-cell
-    /// additions like answered inputs and `$TMP_DIR` (see DESIGN §4).
+    /// additions like answered inputs and `$TMP_DIR` (see DESIGN §2).
     #[arg(short, long = "env", value_parser = parse_key_val, value_name = "KEY=VAL")]
     pub env: Vec<(String, String)>,
 }
@@ -108,9 +108,9 @@ pub struct ExecCmd {
     /// Path of the runbook to execute
     pub path: PathBuf,
 
-    /// Run straight through without per-cell confirmation, and answer input cells
-    /// with their defaults instead of prompting. The sharp edge — runs arbitrary
-    /// code unattended (DESIGN §5).
+    /// Run without prompts. Inputs require supplied environment values or explicit
+    /// defaults; missing or invalid answers stop the run. Confirm defaults are never
+    /// implicitly changed to yes.
     #[arg(short, long)]
     pub yes: bool,
 

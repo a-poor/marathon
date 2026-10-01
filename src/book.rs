@@ -48,8 +48,10 @@ impl Runbook {
         let ast = parse_markdown(doc)?;
 
         // Parse the frontmatter
-        let txt = get_frontmatter_node(&ast)?;
-        let frontmatter: BookFrontmatter = serde_yaml::from_str(&txt)?;
+        let frontmatter = match get_frontmatter_node(&ast) {
+            Some(txt) if !txt.trim().is_empty() => serde_yaml::from_str(&txt)?,
+            _ => BookFrontmatter::default(),
+        };
 
         // Coerce the blocks. Frontmatter (YAML/TOML) is config, not content, so
         // it isn't a navigable/rendered block.
@@ -135,7 +137,7 @@ impl Runbook {
             .unwrap_or_else(|| "TMP_DIR".to_string())
     }
 
-    /// Resolve the shared temp directory, creating it on first use (DESIGN §4).
+    /// Resolve the shared temp directory, creating it on first use (DESIGN §2).
     /// An explicit frontmatter `tmp_dir.path` is created as-is; otherwise a fresh
     /// `mktemp`-style dir is made and (unless `skip_cleanup`) removed on drop.
     pub fn ensure_tmp_dir(&mut self) -> Result<PathBuf> {
@@ -221,7 +223,7 @@ impl Runbook {
         s
     }
 
-    /// Build the environment map injected into the cell at `idx` (DESIGN §4):
+    /// Build the environment map injected into the cell at `idx` (DESIGN §2):
     /// frontmatter `env`, then CLI `--env`, then `TMP_DIR`, then every *preceding*
     /// answered input cell's `target=value` in document order (later layers win).
     pub fn env_for(&self, idx: usize) -> HashMap<String, String> {
@@ -303,7 +305,9 @@ impl Runbook {
     /// has produced no output yet (nothing to copy).
     pub fn output_text(&self, idx: usize) -> Option<String> {
         match self.blocks.get(idx)? {
-            BookBlock::Code(c) if !c.output.is_empty() => Some(c.output.clone()),
+            BookBlock::Code(c) if !c.output.is_empty() => {
+                Some(String::from_utf8_lossy(&c.output).into_owned())
+            }
             _ => None,
         }
     }
@@ -379,9 +383,9 @@ pub struct CodeBlock {
     /// Lifecycle status of the cell (idle / running / ok / error).
     pub state: CodeBlockState,
     /// Combined stdout+stderr captured from the run, accumulated as it streams in.
-    /// Kept separate from `state` because it changes far more frequently (see the
-    /// three-tier note in TODO.md): a chunk appends here without touching `state`.
-    pub output: String,
+    /// Kept separate from `state` because output changes far more frequently.
+    /// Decode only at display/copy boundaries so split UTF-8 remains intact.
+    pub output: Vec<u8>,
     /// When the current run began. Set in [`CodeBlock::begin_run`], used to compute
     /// [`CodeBlock::elapsed`] on finish. A live ticking timer is the footer's job
     /// (it redraws every frame); this only yields the final duration.
@@ -427,8 +431,8 @@ impl CodeBlock {
     }
 
     /// Append a streamed output chunk.
-    pub fn push_output(&mut self, chunk: &str) {
-        self.output.push_str(chunk);
+    pub fn push_output(&mut self, chunk: impl AsRef<[u8]>) {
+        self.output.extend_from_slice(chunk.as_ref());
     }
 
     /// Mark the run finished, recording how long it ran and its exit code.
@@ -467,11 +471,11 @@ impl TryFrom<markdown::mdast::Code> for CodeBlock {
 
         // Format and return
         Ok(Self {
-            lang: val.lang.unwrap_or("sh".into()),
+            lang: val.lang.unwrap_or_default(),
             content: val.value,
             meta,
             state: CodeBlockState::NotRun,
-            output: String::new(),
+            output: Vec::new(),
             started_at: None,
             elapsed: None,
             exit_code: None,
@@ -605,6 +609,9 @@ pub enum MagicInputBlock {
         /// Environment variable to store
         /// output for subsequent commands
         target: String,
+
+        /// Explicit unattended default. A confirmation exports `yes` or `no`.
+        default: Option<bool>,
     },
 
     /// Prompt the user for some input text
@@ -615,6 +622,9 @@ pub enum MagicInputBlock {
         /// Environment variable to store
         /// output for subsequent commands
         target: String,
+
+        /// Explicit default used by `exec --yes` and to seed interactive editing.
+        default: Option<String>,
     },
 
     /// Prompt the user to select
@@ -625,6 +635,9 @@ pub enum MagicInputBlock {
         /// Environment variable to store
         /// output for subsequent commands
         target: String,
+
+        /// The default option's value, not its numeric index.
+        default: Option<String>,
 
         /// List of options from which the
         /// user can choose
@@ -637,6 +650,13 @@ pub enum MagicInputBlock {
 }
 
 impl MagicInputBlock {
+    pub fn default_value(&self) -> Option<String> {
+        match self {
+            Self::Confirm { default, .. } => default.map(|v| if v { "yes" } else { "no" }.into()),
+            Self::Input { default, .. } | Self::Select { default, .. } => default.clone(),
+        }
+    }
+
     pub fn prompt(&self) -> &str {
         match self {
             Self::Confirm { prompt, .. }
@@ -882,26 +902,53 @@ impl InputCell {
     /// trimmed. Best-effort — an unreadable `option_file` leaves just the inline
     /// options. No-op for non-select cells.
     pub fn refresh_options(&mut self, env: &HashMap<String, String>) {
+        let _ = self.try_refresh_options(env);
+    }
+
+    /// Strict variant for CLI execution: report unreadable option files instead
+    /// of silently answering an empty selection.
+    pub fn try_refresh_options(&mut self, env: &HashMap<String, String>) -> Result<()> {
         let MagicInputBlock::Select {
             options,
             option_file,
             ..
         } = &self.config
         else {
-            return;
+            return Ok(());
         };
-        let mut opts: Vec<String> = options.clone().unwrap_or_default();
-        if let Some(raw) = option_file
-            && let Ok(text) = std::fs::read_to_string(expand_env(raw, env))
-        {
-            opts.extend(
+        self.loaded_options = options.clone().unwrap_or_default();
+        if let Some(raw) = option_file {
+            let path = expand_env(raw, env);
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow!("reading option file {path}: {e}"))?;
+            self.loaded_options.extend(
                 text.lines()
                     .map(str::trim)
                     .filter(|l| !l.is_empty())
-                    .map(str::to_string),
+                    .map(str::to_owned),
             );
         }
-        self.loaded_options = opts;
+        Ok(())
+    }
+
+    /// Validate and record a CLI-supplied answer using the same state as the TUI.
+    pub fn answer(&mut self, value: String) -> Result<()> {
+        let value = match &self.config {
+            MagicInputBlock::Confirm { .. } => match value.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" | "true" => "yes".to_owned(),
+                "n" | "no" | "false" => "no".to_owned(),
+                _ => anyhow::bail!("{}: expected yes or no", self.target()),
+            },
+            MagicInputBlock::Select { .. } if !self.options().contains(&value) => {
+                anyhow::bail!(
+                    "{}: value is not one of the available options",
+                    self.target()
+                );
+            }
+            _ => value,
+        };
+        self.state = InputState::Answered { value };
+        Ok(())
     }
 
     fn option_at(&self, idx: usize) -> Option<&str> {
@@ -932,13 +979,14 @@ impl InputCell {
             InputState::Answered { value } => Some(value.clone()),
             _ => None,
         };
+        let seed = prior.clone().or_else(|| self.config.default_value());
         let draft = match &self.config {
-            MagicInputBlock::Confirm { .. } => Draft::Confirm(prior.as_deref() == Some("yes")),
+            MagicInputBlock::Confirm { .. } => Draft::Confirm(seed.as_deref() == Some("yes")),
             MagicInputBlock::Input { .. } => {
-                Draft::Text(TextDraft::seeded(prior.clone().unwrap_or_default()))
+                Draft::Text(TextDraft::seeded(seed.clone().unwrap_or_default()))
             }
             MagicInputBlock::Select { .. } => {
-                let idx = prior
+                let idx = seed
                     .as_deref()
                     .and_then(|v| self.options().iter().position(|o| o == v))
                     .unwrap_or(0);
@@ -1077,6 +1125,7 @@ mod tests {
         InputCell::new(MagicInputBlock::Confirm {
             prompt: "Proceed?".into(),
             target: "OK".into(),
+            default: None,
         })
     }
 
@@ -1084,6 +1133,7 @@ mod tests {
         InputCell::new(MagicInputBlock::Input {
             prompt: "Name?".into(),
             target: "NAME".into(),
+            default: None,
         })
     }
 
@@ -1091,9 +1141,39 @@ mod tests {
         InputCell::new(MagicInputBlock::Select {
             prompt: "Pick".into(),
             target: "CHOICE".into(),
+            default: None,
             options: Some(vec!["a".into(), "b".into(), "c".into()]),
             option_file: None,
         })
+    }
+
+    #[test]
+    fn split_utf8_output_is_decoded_only_at_the_text_boundary() {
+        let mut book = Runbook::new(None::<&str>, "```sh\necho test\n```").unwrap();
+        let BookBlock::Code(cell) = &mut book.blocks[0] else {
+            panic!("code");
+        };
+        cell.push_output([0xe2]);
+        cell.push_output([0x82, 0xac, 0xff]);
+        assert_eq!(book.output_text(0).as_deref(), Some("€�"));
+    }
+
+    #[test]
+    fn explicit_input_defaults_seed_editors_without_becoming_answers_on_cancel() {
+        for config in [
+            r#"{"type":"input","prompt":"Name?","target":"NAME","default":"hello"}"#,
+            r#"{"type":"confirm","prompt":"Proceed?","target":"OK","default":true}"#,
+            r#"{"type":"select","prompt":"Pick?","target":"CHOICE","options":["a","b"],"default":"b"}"#,
+        ] {
+            let mut cell = InputCell::new(serde_json::from_str(config).unwrap());
+            let expected = cell.config.default_value().unwrap();
+            cell.begin_edit(&HashMap::new());
+            cell.cancel();
+            assert!(cell.resolved().is_none());
+            cell.begin_edit(&HashMap::new());
+            cell.submit();
+            assert_eq!(cell.resolved().unwrap().1, expected);
+        }
     }
 
     #[test]
@@ -1110,6 +1190,7 @@ mod tests {
         let mut cell = InputCell::new(MagicInputBlock::Select {
             prompt: "Pick".into(),
             target: "CHOICE".into(),
+            default: None,
             options: None,
             option_file: Some(path.display().to_string()),
         });
@@ -1132,6 +1213,7 @@ mod tests {
         let cell = InputCell::new(MagicInputBlock::Select {
             prompt: "Pick".into(),
             target: "CHOICE".into(),
+            default: None,
             options: Some(vec!["inline".into()]),
             option_file: Some(path.display().to_string()),
         });
@@ -1148,6 +1230,7 @@ mod tests {
         let mut cell = InputCell::new(MagicInputBlock::Select {
             prompt: "Pick".into(),
             target: "CHOICE".into(),
+            default: None,
             options: None,
             option_file: Some(path.display().to_string()),
         });
@@ -1167,6 +1250,7 @@ mod tests {
         let mut cell = InputCell::new(MagicInputBlock::Select {
             prompt: "Pick".into(),
             target: "CHOICE".into(),
+            default: None,
             options: None,
             option_file: Some("${TMP_DIR}/choices.txt".into()),
         });
@@ -1329,7 +1413,7 @@ mod tests {
             },
             content: String::new(),
             state: CodeBlockState::NotRun,
-            output: String::new(),
+            output: Vec::new(),
             started_at: None,
             elapsed: None,
             exit_code: None,

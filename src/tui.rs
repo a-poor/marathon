@@ -30,28 +30,7 @@ enum Mode {
     Active,
 }
 
-/// Signal a running cell's process group (negated pid → the whole group the child
-/// leads), interrupting the shell and anything it spawned. `hard` escalates from
-/// SIGINT (graceful) to SIGKILL. Unix only; a no-op elsewhere (the runner doesn't
-/// create a process group off-unix anyway).
-#[cfg(unix)]
-fn cancel_pid(pid: u32, hard: bool) {
-    let sig = if hard { libc::SIGKILL } else { libc::SIGINT };
-    // SAFETY: a bare `kill(2)` syscall; an invalid/stale pid just returns ESRCH.
-    unsafe {
-        libc::kill(-(pid as i32), sig);
-    }
-}
-
-#[cfg(not(unix))]
-fn cancel_pid(_pid: u32, _hard: bool) {}
-
-/// The interactive runbook viewer.
-///
-/// Holds the parsed [`Runbook`] and drives the draw/event loop. For now it is a
-/// read-only viewer: the document renders as one scrollable, wrapped markdown
-/// page (via [`DocumentView`]) and the user moves a per-cell selection through
-/// it. Executing the selected cell is the next step.
+/// Interactive runbook viewer and owner of all active cell tasks.
 pub struct App {
     book: Runbook,
     scroll: ScrollState,
@@ -74,17 +53,15 @@ pub struct App {
     /// The most recent cell finish (its settled state + when), so the badge can
     /// briefly reveal the latest outcome for [`FINISH_BADGE_TIMEOUT`] before idling.
     last_finish: Option<(Status, std::time::Instant)>,
-    /// OS process ids of currently-running cells, by block index — populated on
-    /// [`RunMsg::Started`], cleared on [`RunMsg::Finished`]. Lets backspace signal a
-    /// run to cancel it.
-    running_pids: HashMap<usize, u32>,
+    /// One owner per running cell, inserted before its task can emit output.
+    runs: HashMap<usize, runner::RunningCell>,
     /// The system clipboard handle, opened once at startup (held alive so the
     /// clipboard persists on platforms that serve it from the owning process, e.g.
     /// X11). `None` if the platform has no clipboard available.
     clipboard: Option<arboard::Clipboard>,
     /// Channel for finished cell runs, drained as a `select!` arm in [`App::run`].
-    run_tx: mpsc::UnboundedSender<RunMsg>,
-    run_rx: mpsc::UnboundedReceiver<RunMsg>,
+    run_tx: mpsc::Sender<RunMsg>,
+    run_rx: mpsc::Receiver<RunMsg>,
 }
 
 /// How long a footer flash message stays visible.
@@ -95,7 +72,7 @@ const FINISH_BADGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl App {
     pub fn new(book: Runbook) -> Self {
-        let (run_tx, run_rx) = mpsc::unbounded_channel();
+        let (run_tx, run_rx) = mpsc::channel(runner::CHANNEL_CAPACITY);
         Self {
             book,
             scroll: ScrollState::new(),
@@ -108,7 +85,7 @@ impl App {
             start: std::time::Instant::now(),
             flash: None,
             last_finish: None,
-            running_pids: HashMap::new(),
+            runs: HashMap::new(),
             clipboard: arboard::Clipboard::new().ok(),
             run_tx,
             run_rx,
@@ -130,20 +107,41 @@ impl App {
         let mut events = EventStream::new();
         let mut frames = tokio::time::interval(Duration::from_secs_f32(1.0 / 30.0));
 
-        while !self.exit {
-            tokio::select! {
-                _ = frames.tick() => {
-                    terminal.draw(|frame| self.draw(frame))?;
-                }
-                Some(Ok(event)) = events.next() => {
-                    self.handle_event(&event);
-                }
-                Some(msg) = self.run_rx.recv() => {
-                    self.apply_run_msg(msg);
+        let signal = crate::term::termination();
+        tokio::pin!(signal);
+        let result = async {
+            while !self.exit {
+                tokio::select! {
+                    result = &mut signal => { result?; self.exit = true; }
+                    _ = frames.tick() => {
+                        terminal.draw(|frame| self.draw(frame))?;
+                    }
+                    event = events.next() => {
+                        match event {
+                            Some(Ok(event)) => self.handle_event(&event),
+                            Some(Err(e)) => return Err(e.into()),
+                            None => break,
+                        }
+                    }
+                    Some(msg) = self.run_rx.recv() => self.apply_run_msg(msg),
                 }
             }
+            Ok(())
         }
-        Ok(())
+        .await;
+        // This also runs on draw/input errors, before the runbook drops TMP_DIR.
+        self.shutdown_runs().await;
+        result
+    }
+
+    async fn shutdown_runs(&mut self) {
+        self.run_rx.close();
+        for run in self.runs.values() {
+            run.cancel(true);
+        }
+        for (_, run) in self.runs.drain() {
+            run.shutdown().await;
+        }
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -198,7 +196,7 @@ impl App {
 
         // A transient flash (e.g. "copied") takes over the center while it's active.
         if let Some(msg) = self.flash_active() {
-            footer = footer.flash(Line::from(format!("✓ {msg}")).green().bold());
+            footer = footer.flash(Line::from(msg.to_owned()));
         }
         footer
     }
@@ -232,6 +230,10 @@ impl App {
     /// returns nothing because the loop owns the draw/error path.
     fn handle_event(&mut self, event: &Event) {
         if let Some(key) = event.as_key_press_event() {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.exit = true;
+                return;
+            }
             // The help modal is a global overlay: while open it swallows keys and is
             // dismissed with Esc (or `?`), so the underlying mode never sees them.
             if self.show_help {
@@ -364,6 +366,13 @@ impl App {
         let Some(idx) = self.selected_block() else {
             return;
         };
+        if self.runs.contains_key(&idx) {
+            self.flash = Some((
+                "cancel the running cell before clearing it".into(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
         match self.book.blocks.get_mut(idx) {
             Some(BookBlock::Code(c)) => c.clear(),
             Some(BookBlock::Input(i)) => i.clear(),
@@ -378,6 +387,13 @@ impl App {
     /// `X`: reset every cell (all code outputs and input answers). Also discards the
     /// temp dir and mints a fresh one, kept visible in the header from the next frame.
     fn clear_all(&mut self) {
+        if !self.runs.is_empty() {
+            self.flash = Some((
+                "cancel running cells before resetting".into(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
         self.book.clear_all();
         let _ = self.book.ensure_tmp_dir();
         self.revision += 1;
@@ -398,6 +414,9 @@ impl App {
     /// Spawn the code cell at `idx`: mark it Running now, build its interpreter +
     /// script + env, and run it off-thread; the result returns via `run_rx`.
     fn run_selected(&mut self, idx: usize) {
+        if self.runs.contains_key(&idx) {
+            return;
+        }
         // TMP_DIR must exist before we build the env map that references it.
         if let Err(e) = self.book.ensure_tmp_dir() {
             self.set_cell_error(idx, format!("tmp dir: {e}"));
@@ -416,7 +435,7 @@ impl App {
         // TUI runs are color-off (we strip SGR on display anyway): hint tools to
         // emit no color at the source so there's less to sanitize. A frontmatter/CLI
         // `NO_COLOR` override still wins. CLI `exec` deliberately won't do this — the
-        // real terminal there interprets color (DESIGN §7).
+        // real terminal there interprets color (DESIGN §5).
         env.entry("NO_COLOR".to_string())
             .or_insert_with(|| "1".to_string());
 
@@ -426,8 +445,8 @@ impl App {
         self.book.last_run = Some(idx);
         self.revision += 1;
 
-        let tx = self.run_tx.clone();
-        tokio::spawn(runner::run_streaming(idx, interp, script, env, tx));
+        let run = runner::spawn_run(idx, interp, script, env, self.run_tx.clone());
+        self.runs.insert(idx, run);
     }
 
     /// Backspace: escalate a cancellation of the selected cell's run, if it's running.
@@ -439,7 +458,7 @@ impl App {
         let Some(idx) = self.selected_block() else {
             return;
         };
-        let Some(&pid) = self.running_pids.get(&idx) else {
+        let Some(run) = self.runs.get(&idx) else {
             return;
         };
         let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) else {
@@ -448,20 +467,20 @@ impl App {
         match c.cancel {
             Cancel::None => {
                 c.cancel = Cancel::Interrupting;
-                cancel_pid(pid, false);
+                run.cancel(false);
             }
             Cancel::Interrupting => {
                 c.cancel = Cancel::Killing;
-                cancel_pid(pid, true);
+                run.cancel(true);
             }
-            Cancel::Killing => cancel_pid(pid, true),
+            Cancel::Killing => run.cancel(true),
         }
         self.revision += 1;
     }
 
     fn set_cell_error(&mut self, idx: usize, msg: String) {
         if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
-            c.output = msg;
+            c.output = msg.into_bytes();
             c.state = CodeBlockState::Error;
         }
         self.revision += 1;
@@ -470,21 +489,24 @@ impl App {
     /// Fold a streamed run message back into the document.
     fn apply_run_msg(&mut self, msg: RunMsg) {
         match msg {
-            RunMsg::Started { idx, pid } => {
-                // Track the pid so backspace can signal this run; nothing to redraw.
-                self.running_pids.insert(idx, pid);
-                return;
-            }
             RunMsg::Output { idx, chunk } => {
                 if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
                     c.push_output(&chunk);
                 }
             }
-            RunMsg::Finished { idx, success, code } => {
+            RunMsg::Finished {
+                idx,
+                success,
+                code,
+                error,
+            } => {
                 if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
+                    if let Some(error) = error {
+                        c.push_output(format!("\nfailed to run: {error}\n"));
+                    }
                     c.finish(success, code);
                 }
-                self.running_pids.remove(&idx);
+                self.runs.remove(&idx);
                 // Record the latest outcome so the badge can briefly reveal it.
                 let state = if success { Status::Done } else { Status::Error };
                 self.last_finish = Some((state, std::time::Instant::now()));
@@ -548,5 +570,110 @@ impl App {
 
         // Any active-mode key may have changed what the cell renders.
         self.revision += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(script: &str) -> App {
+        let book = Runbook::new(None::<&str>, &format!("```sh\n{script}\n```\n")).unwrap();
+        let mut app = App::new(book);
+        app.scroll.select_index(1, 2);
+        app
+    }
+
+    async fn next(app: &mut App) {
+        let msg = tokio::time::timeout(Duration::from_secs(3), app.run_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.apply_run_msg(msg);
+    }
+
+    #[tokio::test]
+    async fn duplicate_enter_runs_once_and_reset_preserves_active_scratch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("runs");
+        let mut app = app("echo start >> \"$LOG\"; printf ready; sleep 10");
+        app.book
+            .cli_env
+            .insert("LOG".into(), log.display().to_string());
+        app.activate_or_run();
+        app.activate_or_run();
+        assert_eq!(app.runs.len(), 1);
+        next(&mut app).await;
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "start\n");
+        let tmp = app.book.tmp_dir.clone().unwrap();
+        app.clear_selected();
+        app.clear_all();
+        assert_eq!(app.book.tmp_dir.as_ref(), Some(&tmp));
+        assert!(tmp.exists());
+        assert_eq!(app.book.run_counts().running, 1);
+        app.shutdown_runs().await;
+        drop(app);
+        assert!(!tmp.exists());
+    }
+
+    #[tokio::test]
+    async fn completed_cell_can_run_again_without_mixed_output() {
+        let mut app = app("printf done");
+        for _ in 0..2 {
+            app.activate_or_run();
+            while !app.runs.is_empty() {
+                next(&mut app).await;
+            }
+            assert_eq!(app.book.output_text(0).as_deref(), Some("done"));
+            assert_eq!(app.book.run_counts().succeeded, 1);
+        }
+        app.shutdown_runs().await;
+    }
+
+    #[tokio::test]
+    async fn quit_waits_for_process_group_cleanup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("survived");
+        let release = dir.path().join("release");
+        let mut app = app(
+            "printf ready; while [ ! -e \"$RELEASE\" ]; do sleep 0.05; done; touch \"$MARKER\"",
+        );
+        app.book
+            .cli_env
+            .insert("MARKER".into(), marker.display().to_string());
+        app.book
+            .cli_env
+            .insert("RELEASE".into(), release.display().to_string());
+        app.activate_or_run();
+        next(&mut app).await;
+        app.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.exit);
+        app.shutdown_runs().await;
+        std::fs::write(release, "go").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn cancel_before_spawn_and_ctrl_c_in_edit_mode() {
+        let mut app = app("sleep 10");
+        app.activate_or_run();
+        app.cancel_selected();
+        app.cancel_selected();
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        assert_eq!(app.book.run_counts().errored, 1);
+        app.mode = Mode::Active;
+        app.show_help = true;
+        app.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.exit);
+        app.shutdown_runs().await;
     }
 }

@@ -44,7 +44,7 @@ echo "deploying to $REGION"
 
 ## Frontmatter (all fields optional)
 
-YAML frontmatter configures the whole runbook:
+The YAML frontmatter block itself is optional. When present, it configures the whole runbook:
 
 - `title`, `description` — shown in the TUI header.
 - `env` — map of variables set for **every** cell. `{ KEY: value }`.
@@ -61,7 +61,7 @@ YAML frontmatter configures the whole runbook:
   ```
   Defaults to `/usr/bin/env <lang>`.
 - `tmp_dir` — config for the shared temp directory (see "State model"):
-  - `path` — pin an explicit directory (default: a fresh `mktemp`-style dir).
+  - `path` — pin an explicit directory that Marathon never removes (default: a fresh `mktemp`-style dir).
   - `skip_cleanup: true` — keep the dir after the run (default removes it).
   - `var_name` — name of the env var pointing at it (default `TMP_DIR`).
 
@@ -117,18 +117,22 @@ Three `type`s:
 ````
 
 - `input` — free-form text → `$target`.
-- `confirm` — yes/no gate → `$target` is `yes` or `no`.
+- `confirm` — yes/no answer → `$target` is `yes` or `no`; shell code must branch on it.
 - `select` — pick one; provide inline `options: [...]` **or** an `option_file`
   (a path, may reference `$TMP_DIR`, one option per line — typically produced by an
-  earlier cell).
+  earlier cell). Inline options and file lines can be combined; file lines are
+  trimmed and blank lines skipped.
+- Optional `default`: a string for `input`/`select`, a boolean for `confirm`.
+  Selection defaults are option values, not indexes. Defaults seed the TUI editor
+  and allow `exec --yes` to answer without prompting.
 
 ## State model — how values reach a cell
 
-A cell's environment is layered (later wins):
+A cell inherits the parent process environment, then layers (later wins):
 
 1. frontmatter `env`
 2. CLI `--env KEY=VAL` (repeatable)
-3. `$TMP_DIR` (the shared temp dir, created on first run)
+3. `$TMP_DIR` (the shared temp dir, created for the session)
 4. every **preceding** answered input cell's `target=value`, in document order
 
 So the pattern for passing data between isolated cells is: write a file under
@@ -139,8 +143,14 @@ cell and reference `$target` downstream.
 
 - `marathon run <file>` — interactive TUI, step through cell by cell (the safe
   default; you confirm each cell).
-- `marathon exec <file>` — headless run, output to stdout (CI / pipes). `--yes`
-  runs straight through without confirmation.
+- `marathon exec <file>` — sequential execution with confirmation before each
+  shell cell and prompts for input. No/blank cell confirmation stops the run;
+  EOF is an error. Prompts/diagnostics go to stderr; raw command bytes go to stdout.
+- `marathon exec <file> --yes` — unattended execution. Inputs must have a supplied
+  environment value or an explicit default; missing/invalid values stop the run.
+  `--yes` never implicitly answers a confirmation yes. Supply overrides with `-e`.
+  Supplied input values are validated and used without prompting in either mode.
+  Normal failed-cell exit codes are preserved; Ctrl-C cleans up and exits 130.
 - `marathon validate <file>` (alias `check`) — parse and report; run nothing.
 - `marathon new <file>` — scaffold a minimal runbook.
 - `-e/--env KEY=VAL` (on `run`/`exec`, repeatable) — inject env vars.
@@ -153,6 +163,9 @@ When editing a runbook, you can sanity-check it with `marathon validate <file>`.
 - Shell cells use `sh`/`bash`/`zsh`; illustrative ones are marked `skip=true`.
 - Cross-cell data goes through `$TMP_DIR` files or input-cell `target`s, never
   assumed shared shell state.
-- Input cells are valid JSON with `type`, `prompt`, and `target`.
+- Input cells are valid JSON with `type`, `prompt`, and `target`. For unattended
+  runs, provide `default` or document the required `-e` values.
+- Cell stdin carries the script; use Marathon input cells for prompting. Programs
+  requiring an interactive terminal are not supported by the current runner.
 - Remember `set -eu` is on by default — a failing command or unset var fails the
   cell loudly.

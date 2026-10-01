@@ -2,14 +2,14 @@
 //!
 //! ratatui renders bytes literally — it does **not** interpret ANSI — so raw
 //! output from real commands (color, progress bars, cursor moves, OSC titles)
-//! would corrupt the display. Per DESIGN §7 we sanitize at the TUI boundary only;
+//! would corrupt the display. Per DESIGN §5 we sanitize at the TUI boundary only;
 //! the CLI path passes raw bytes straight to the real terminal, which interprets
 //! them itself.
 //!
 //! MVP policy is the **strip-everything** path: remove all escape sequences
 //! (including SGR color), collapse carriage-return rewrites to their final
 //! segment, expand tabs, and drop any stray control bytes. Parsing SGR into
-//! ratatui styles (i.e. preserving color) is a deferred enhancement (DESIGN §7).
+//! ratatui styles (i.e. preserving color) is a deferred enhancement (DESIGN §5).
 
 /// Tab stop width used when expanding `\t` to spaces.
 const TAB_WIDTH: usize = 8;

@@ -1,216 +1,158 @@
-# Marathon — Design
+# Marathon — implementation contracts
 
-> Status: **draft / MVP design**. This describes the intended MVP and flags
-> deliberately-deferred features. It is a direction, not a frozen spec.
+Marathon is a working CLI/TUI MVP for Markdown runbooks. This document describes
+current behavior; [TODO.md](TODO.md) tracks deferred work. User-facing examples and
+commands live in [README.md](README.md).
 
-## 1. What marathon is
+## 1. Format and compatibility
 
-`marathon` is a CLI/TUI for viewing, validating, and
-running markdown **runbooks** — markdown documents whose fenced code blocks can be
-executed in order.
+A runbook is ordinary Markdown. Marathon-specific configuration uses, in order:
 
-The guiding constraint: **a runbook is just a markdown file.** You can write one in
-any editor, and it renders cleanly in any markdown tool (GitHub, Pandoc, glow, …).
-Marathon-specific behavior is layered *on top of* standard markdown, never via
-syntax that breaks other renderers.
+1. Optional YAML frontmatter for document settings.
+2. Bare `key=value` pairs after a fence's language for per-cell settings.
+3. `json mrthn=input` blocks for structured prompts.
 
-The mental model for the TUI is **glow + Jupyter**: a rendered markdown document
-that is also a sequence of runnable cells.
+The Markdown parser uses GFM plus frontmatter. Only top-level `sh`, `bash`, and
+`zsh` code blocks are runnable; `skip=true` disables execution. Unknown languages,
+unlabeled fences, and indented code are display-only. Nested Markdown is prose,
+not a nested execution graph. Frontmatter fields are documented in the README.
+Unknown frontmatter fields are tolerated for compatibility with other Markdown tools.
 
-Design value: **lean simple.** Prefer the least machinery that is still useful.
-Reach for new mechanisms only when an existing one genuinely can't carry the weight.
+`validate` parses Markdown, YAML, fence metadata, and input JSON. It does not
+execute commands, validate shell syntax, check installed interpreters, or require
+option files that a preceding cell may produce.
 
-## 2. The layering strategy (how config rides on markdown)
+## 2. Processes and shared state
 
-Marathon adds configuration in three layers, in order of preference. Always prefer
-the earliest layer that works:
+Each code cell runs in a separate interpreter process, with its script supplied on
+stdin. The working directory is Marathon's invocation directory. The default
+interpreter is `/usr/bin/env <language>`; `interpreters.<language>.path` overrides it
+using whitespace-separated argv, without shell quoting/expansion.
 
-1. **Frontmatter** — YAML at the top of the file. Document-level config.
-2. **Code-block info string** — `key=value` pairs after the language token.
-   Per-cell config. Standard markdown renderers use only the first token (the
-   language) for highlighting and ignore the rest, so this stays compatible.
-3. **Special code blocks** (last resort) — a normal `json` block tagged with a
-   marathon role. Used only when 1 and 2 can't express it (notably: prompting the
-   user for input). Kept as `json` (not a custom fence) so other tools still
-   highlight it.
+The script is `before_each` + cell body + `after_each`. Omitted `before_each`
+defaults to `set -eu`; an empty value opts out. Custom hooks replace the default.
+`after_each` is appended shell code, not an unconditional cleanup handler.
+`pipefail` is not part of the portable default.
 
-### Info-string syntax
+Cells do not share `cd`, functions, or shell-local variables. Their environments
+inherit Marathon's process environment, then layer:
 
-````
-Here's some markdown prelude.
+1. frontmatter `env`;
+2. CLI `--env KEY=VALUE` overrides;
+3. the scratch-directory variable (`TMP_DIR` by default);
+4. answered input cells preceding this cell in document order.
 
-```sh skip=true foo=bar
-echo "$GREETING"
-```
+The scratch directory is created for the session and held by a `TempDir` guard.
+It is removed only after active processes have stopped. `skip_cleanup: true`
+preserves automatic scratch directories. Explicit `tmp_dir.path` directories are
+always user-owned and are never removed, including on reset.
 
-More markdown text.
-````
+## 3. Input cells
 
-- The first token (`sh`) is the language → other renderers highlight it as shell.
-- Everything after is `key=value` pairs, parsed with the `serde-kv` crate into
-  `CodeBlockMeta`.
-- Compatibility note: Pandoc has a formal `{.sh key=value}` attribute form, but
-  GitHub does not understand it and would show the braces as the language. Bare
-  `key=value` after the language is the more broadly compatible choice, so that is
-  what marathon uses.
+`json mrthn=input` has `type`, `prompt`, and `target`, plus type-specific fields:
 
-### Canonical naming
+| Type | Answer | Optional `default` |
+| --- | --- | --- |
+| `input` | Arbitrary text, including empty text | String |
+| `confirm` | `yes` or `no` | Boolean |
+| `select` | A value from the available options | String option value |
 
-- The special-block role key is **`mrthn`**: `` ```json mrthn=input ``. (A short,
-  unobtrusive namespace that leaves room for future roles like `mrthn=table`.)
-- Ordinary per-cell options are bare keys: `skip=true`.
+Selections combine inline `options` and lines read from `option_file`. File lines
+are trimmed and blank lines omitted. `$NAME`/`${NAME}` in paths expand against the
+cell environment; unknown references remain literal, `$$` yields `$`, and no shell
+substitution is performed. Options are refreshed when an input is reached/edited.
+CLI reads are strict; TUI loading is currently best-effort.
 
-## 3. Cells and execution
+Input state is pending, editing (draft plus prior answer), or answered. In the TUI,
+explicit defaults seed the editor; cancellation restores the prior answer. CLI
+answers use the same answered state. A confirmation is data, not a control-flow
+gate: shell code must branch on the exported `yes`/`no` value.
 
-A runbook parses (via the `markdown` crate → `mdast`) into a flat, ordered list of
-**cells**. Markdown prose between code blocks is rendered as-is; fenced code blocks
-are the runnable/interactive cells. There is **no container/nesting** — the document
-is a flat sequence.
+## 4. Owning a run
 
-### What runs
+`runner::spawn_run` returns a `RunningCell` owner immediately, before scheduling
+can race with another key event. It owns a task and a cancellation channel. The
+TUI stores one owner per block index; a block cannot restart or clear until its
+finished message is consumed. Reset-all is blocked while any run exists.
+Different blocks can execute concurrently in the TUI.
 
-- **MVP runners:** shell only — `sh` / `bash` / `zsh`.
-- Recognized shell languages **default to runnable**; opt out per cell with
-  `skip=true`.
-- Unknown languages are **display-only** (rendered, never executed) in the MVP.
-- Frontmatter may **remap a language to an actual binary**, shebang-style — e.g.
-  "when you see `sh`, actually run `/usr/bin/env zsh`."
+On Unix each cell leads a new process group. Backspace requests SIGINT; a second
+press requests SIGKILL. A stop requested before spawn is retained. Quit, terminal
+errors, CLI interruption, and output failures force cleanup and await the task
+before releasing scratch files. A drop guard kills the process group if the task
+is aborted/unwinds. The shell is reaped; descendants remaining in its group are
+terminated when the shell completes. This runner is not a background-service
+supervisor or a sandbox: deliberately detached processes can escape its group.
 
-### How a cell runs
+On non-Unix systems cancellation kills the direct child; descendant cleanup needs
+a native implementation. The default interpreter command also assumes POSIX tools.
 
-Each runnable cell is executed as its own process (`tokio::process::Command`)
-against the configured shell. Cells do **not** share an in-process shell session in
-the MVP (no persisted shell functions, `cd`, or unexported vars). They share state
-two ways only:
+## 5. Output and completion
 
-1. The **environment map** marathon injects at spawn (see §4).
-2. **Files**, via the shared `TMP_DIR` (see §4).
+The runner reads fixed-size byte chunks without waiting for newline or decoding
+UTF-8. Script writing and both output pipes are polled concurrently. A bounded
+channel (32 × at most 8 KiB) applies backpressure. Recognized shell interpreters get
+`exec 2>&1` prepended, preserving stdout/stderr written order. For other interpreter
+remaps both pipes are captured, but their relative ordering is best-effort.
 
-- **Working directory:** the current working directory (where the user invoked
-  marathon). `TMP_DIR` is *separate* scratch space, not the run dir.
+`RunMsg::Output` contains bytes. `Finished` is sent after cleanup with success,
+exit code, and a separate optional runner error. Spawn/read failures do not masquerade
+as command output or signal termination. `run_script` is a collect-as-text library
+adapter over the same runner, converting invalid UTF-8 lossily only at that boundary.
 
-## 4. State model
+The CLI writes command bytes unchanged to stdout. All Marathon prompts, progress,
+and errors go to stderr. The TUI accumulates bytes, decodes the full buffer for
+display/copying (preserving characters split between chunks), and sanitizes ANSI
+escapes, CR progress rewrites, tabs, and controls. It requests `NO_COLOR=1` unless
+overridden. Color rendering and PTYs are deferred.
 
-Marathon owns an **environment map** that accumulates over the run and is injected
-into every shell cell at spawn. There is **no stdout-into-variable capture** in the
-MVP. The map is populated from exactly three sources:
+The TUI shows the last 25 output lines by default; Ctrl-O expands all output.
+Captured TUI output is still unbounded. A width/revision cache avoids rewrapping on
+selection changes, but content changes rebuild the whole document. These are the
+remaining large-output/large-document scaling limits.
 
-1. **Frontmatter `env`** — static key/values; global, available from the first cell.
-2. **`TMP_DIR`** — auto-injected, set to a fresh `mktemp -d`. Shared for the entire
-   run; cells write/read files here to pass durable state. Cleaned up at the end of
-   the run unless retention is requested (CLI flag or frontmatter).
-3. **Input cells** — a `json mrthn=input` cell with a `target` field. When the cell
-   runs, the user's choice is stored in the env map under the name given by
-   `target`, and is then visible to **all subsequent cells**. Frontmatter env is
-   global; input-cell values depend on execution order.
+## 6. CLI execution
 
-> **Deferred (not MVP):** GitHub-Actions-style explicit capture (e.g. a cell writing
-> `KEY=VALUE` to `$MRTHN_ENV` to export into the env map). Worth doing later; left
-> out of the MVP to keep things simple.
+- `run <file>`: interactive TUI; execution order is selected by the user.
+- `exec <file>`: sequential execution, prompting before each runnable cell.
+- `exec <file> --yes`: unattended execution with supplied/default input values.
+- `validate <file>` / `check`: parse and summarize.
+- `new <file>`: scaffold, refusing to overwrite an existing path.
+- `completions <shell>`: generate shell completion code.
+- `skills install`: install bundled authoring guidance.
 
-### Input cells (the one special block)
+Interactive `exec` shows the full script, including hooks, before confirming.
+No/blank confirmation stops the run; EOF is an error. Input values already present
+in the cell environment are validated and used in either mode. Otherwise,
+interactive input prompts use explicit defaults on Enter (`confirm` falls back to
+no, text accepts empty, select requires a choice). `--yes` requires an explicit
+default or supplied value and never automatically approves a confirmation.
+Selections must match available options. Missing/invalid values stop at that input;
+previous code cells may already have executed.
 
-A `json` block tagged `mrthn=input`. Marathon renders a prompt, collects the user's
-choice, and writes it into the env map under `target`. Illustrative shape (subject
-to change):
+The CLI is fail-fast. Normal child exit codes are preserved; signaled children,
+input errors, and runner errors return 1. Ctrl-C returns 130 and Unix SIGTERM returns
+143 after cleanup, including when awaiting a prompt or writing to a full pipe.
+Separate stdin/stdout threads keep blocking standard I/O out of the async signal
+path and Tokio's shutdown; output acknowledgements prevent truncation on success.
 
-```json mrthn=input
-{
-  "type": "select",
-  "multiple": false,
-  "options": "./choices.txt",
-  "target": "CHOICE"
-}
-```
+Compatibility changes from the earlier prototype: `exec` now actually honors
+`--yes`; scripts relying on unattended execution must pass it. Unlabeled blocks no
+longer execute as `sh`, and frontmatter is no longer mandatory.
 
-A preceding `sh` cell can produce `choices.txt` (under `TMP_DIR` or cwd); a
-following `sh` cell can use `"$CHOICE"`. To other markdown tools this is just a
-highlighted JSON block.
+## 7. Architecture and verification
 
-> Future input/render types (other than `input`) are possible but out of MVP scope.
+- `book.rs`: parse/model, environment composition, input state, scratch lifetime.
+- `runner.rs`: process ownership, cancellation, byte streams, completion.
+- `exec.rs`: sequential CLI orchestration, prompting, input resolution.
+- `tui.rs`: event loop, active run owners, navigation/editing, clipboard.
+- `widgets/`: Markdown rendering, wrapping, document cache, footer/help.
+- `term.rs`: shared termination-signal handling.
+- `main.rs` / `cli.rs`: command dispatch and arguments.
+- `scaffold.rs` / `skills.rs`: runbook template and bundled skill installation.
 
-## 5. CLI surface
-
-- `marathon run <file>` — execute a runbook cell by cell.
-- `marathon validate <file>` — parse + check frontmatter/cell metadata without
-  running anything.
-- `marathon new <file>` — scaffold a minimal runbook.
-- `marathon export <file>` — **backburner.** An "eject" that lowers the runbook to a
-  shell script. Explicitly best-effort: it won't be pretty, interactive input cells
-  can't lower cleanly, but it should roughly run and be cleanable by hand. Not an
-  MVP priority.
-
-### Safety posture
-
-**Run at your own peril** — running a runbook executes arbitrary code by design.
-
-- Default `run` goes **cell by cell with enter-to-confirm** before each cell. This
-  is the natural safety gate.
-- `--yes` (or similar) runs straight through without per-cell confirmation.
-- The TUI is inherently safer (you step through); the CLI `--yes` path is the sharp
-  edge, and that's accepted.
-
-## 6. TUI
-
-Combination of **glow** (rendered markdown) and a **Jupyter notebook** (ordered,
-runnable cells). Renders the document, lets the user move between runnable cells,
-run them, see output inline, and respond to input cells. Built on
-ratatui (0.30) + ratatui-textarea + crossterm.
-
-> Implementation note: use the **ratatui** skill — the 0.30 API differs
-> substantially from pre-0.30 material in model training data.
-
-## 7. Output & ANSI handling (tentative — under review)
-
-> **Status: not fixed.** Captured below as a future consideration / working
-> direction. Needs further review before it's settled.
-
-Cell output is captured for display (and exit code for control flow); output is
-**not** bound to variables in the MVP (see §4, and the GitHub-Actions capture
-deferral in §8). Tentative direction:
-
-- **Streaming, merged by default.** Stream stdout+stderr live (piped
-  `tokio::process::Command`), merged into one stream by default. Per-cell sinks are
-  configurable, e.g. `stdout=/dev/null` / `stderr=...`. Color is a configurable
-  toggle.
-- **Merge tradeoff (no pty in MVP).** Merging at the source (`2>&1` / shared fd)
-  gives true ordering but loses which-stream-is-which; two pipes into one sink keep
-  the distinction but order is best-effort. A pty (deferred, see §8) is what closes
-  that gap. Leaning: two-pipe/tagged for the TUI so stderr can be styled; a merged
-  `run.log` is a possible later add.
-- **Sanitize at the TUI boundary only.** In CLI mode, pass raw bytes through (the
-  real terminal interprets ANSI). In TUI mode, ratatui does **not** interpret ANSI,
-  so sanitize when rendering:
-  - SGR color/style (`\x1b[…m`) → parse to ratatui styles when color is on, strip
-    when off.
-  - All other escapes (cursor moves, `\x1b[2J`/`\x1b[K`, OSC title, C0/C1 controls)
-    → **always strip** — these corrupt the TUI.
-  - Normalize `\r` (collapse progress-bar rewrites to the final segment) and expand
-    tabs.
-- **Color at the source.** Color-off can also set `NO_COLOR=1` in the child env
-  (force-on via `CLICOLOR_FORCE=1`) so many tools emit no SGR at all; still strip
-  defensively.
-- Candidate crates: `strip-ansi-escapes` (color-off path), `ansi-to-tui` (color-on
-  path). Full fidelity (`vt100`/`vte`/`tui-term` screen grid) is the pty upgrade,
-  not MVP.
-
-## 8. Deferred / future ideas (explicitly out of MVP)
-
-Kept here so the MVP stays small but the door stays open:
-
-- **Multiple kernels/runners** — Python, JS, SQL, etc. beyond shell.
-- **Persistent shared session** — a pty-backed runner so cells share real shell
-  state (vars, functions, `cd`), instead of separate processes + env map + files.
-- **GitHub-Actions-style env capture** — cells exporting values into the env map.
-- **Templating** — minijinja-style (à la dbt). Deferred; the env map already covers
-  most of the need via plain `$VARS`, and templating muddies the "just shell + env"
-  model.
-- **Richer special blocks** — additional `mrthn=` render/input types.
-- **`TMP_DIR` retention / run dir** options beyond the basic flag.
-
-## 9. Current code state
-
-Early scaffold. `cli::App` has no subcommands yet; `book::BookFrontmatter` is empty
-and `book::CodeBlockMeta` has only `skip`; `widget_markdown::render_md_node` is a
-`todo!()` match over every `mdast` node; `term.rs` and `tui.rs` are empty. This
-document is the target these grow toward.
+Tests exercise model and rendering behavior, real shell execution, process
+cancellation, and the actual CLI binary. Keep regression cases for byte fidelity,
+partial output, duplicate starts, reset/quit, output backpressure, failed writes,
+signals, confirmation, input defaults/validation, exit codes, and scratch cleanup.
+Tests must use disposable directories and deterministic local commands.

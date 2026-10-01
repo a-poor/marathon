@@ -20,17 +20,10 @@ pub(crate) fn parse_markdown(doc: &str) -> Result<Root> {
     }
 }
 
-/// Pulls the yaml frontmatter string from an mdast document.
-///
-/// If there is no frontmatter or if it isn't yaml, will error.
-///
-/// TODO: This should probably return a custom error that can be
-/// checked against. Especially for the `check` subcommand.
-pub(crate) fn get_frontmatter_node(root: &Root) -> Result<String> {
-    for n in root.children.iter() {
-        if let Node::Yaml(yn) = n {
-            return Ok(yn.value.clone());
-        }
-    }
-    Err(anyhow!("no frontmatter yaml found"))
+/// Optional YAML configuration; ordinary Markdown needs no frontmatter.
+pub(crate) fn get_frontmatter_node(root: &Root) -> Option<String> {
+    root.children.iter().find_map(|n| match n {
+        Node::Yaml(yaml) => Some(yaml.value.clone()),
+        _ => None,
+    })
 }

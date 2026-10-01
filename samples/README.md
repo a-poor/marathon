@@ -1,15 +1,16 @@
 # Sample runbooks
 
-Hand-written examples that double as living documentation for the features in
-[`../DESIGN.md`](../DESIGN.md). Each file is valid standalone markdown — it renders
-fine in any markdown tool, and runs as a runbook under `marathon`.
+These are ordinary Markdown files and local examples of the implemented format.
+Open one with `marathon run samples/<file>.md`, or execute it sequentially with
+`marathon exec samples/<file>.md`. Add `--yes` for unattended execution.
 
 | File | Demonstrates |
 | --- | --- |
-| [`hello.md`](hello.md) | Frontmatter `env`, a runnable cell, `skip=true` opt-out |
-| [`tmpdir.md`](tmpdir.md) | Passing state between cells via files under `$TMP_DIR` |
-| [`interactive.md`](interactive.md) | A `json mrthn=input` cell that exports a choice via `target` |
-| [`shell-override.md`](shell-override.md) | Remapping a language to a real interpreter in frontmatter |
+| [hello.md](hello.md) | Frontmatter environment, shell cells, `skip=true` |
+| [tmpdir.md](tmpdir.md) | State shared through `$TMP_DIR`; requires `bc` |
+| [interactive.md](interactive.md) | Generated options, text, confirmation, explicit defaults |
+| [shell-override.md](shell-override.md) | `interpreters.sh.path`; requires `zsh` |
+| [demo.md](demo.md) | TUI demonstration including an intentional failure and long output |
 
-> These are illustrative. Frontmatter/cell field shapes here are the *intended*
-> design (see `DESIGN.md`); they may shift as the implementation lands.
+`demo.md` is intended for manually stepping through the TUI. Its input has no
+unattended default and its failure cell intentionally stops `exec`.
