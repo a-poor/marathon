@@ -114,6 +114,13 @@ pub struct ExecCmd {
     #[arg(short, long)]
     pub yes: bool,
 
+    /// List cell ordinals, stable IDs, and prerequisites without executing anything.
+    #[arg(long, conflicts_with_all = ["cell", "from", "to"])]
+    pub list: bool,
+
+    #[command(flatten)]
+    pub selection: crate::execution::Selection,
+
     #[command(flatten)]
     pub common: CommonArgs,
 }

@@ -58,7 +58,28 @@ async fn run(cmd: RunCmd) -> Result<()> {
 /// Run sequentially, then propagate the command status after all cleanup.
 async fn exec(cmd: ExecCmd) -> Result<()> {
     let book = load(&cmd.path, cmd.common.env).await?;
-    let code = marathon::exec::execute(book, cmd.yes).await?;
+    if cmd.list {
+        for idx in book.cells() {
+            let kind = match &book.blocks[idx] {
+                BookBlock::Code(c) => c.lang.as_str(),
+                BookBlock::Input(c) => c.kind(),
+                _ => unreachable!(),
+            };
+            let needs: Vec<_> = book
+                .prerequisites(idx)
+                .into_iter()
+                .map(|i| book.cell_label(i))
+                .collect();
+            let suffix = if needs.is_empty() {
+                String::new()
+            } else {
+                format!(" — needs {}", needs.join(", "))
+            };
+            println!("{}  {kind}{suffix}", book.cell_label(idx));
+        }
+        return Ok(());
+    }
+    let code = marathon::exec::execute_selected(book, cmd.yes, &cmd.selection).await?;
     if code != 0 {
         std::process::exit(code);
     }

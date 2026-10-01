@@ -265,8 +265,20 @@ fn build_document(
     ranges.push(0..lines.len());
     lines.push(Line::default());
 
-    for block in &book.blocks {
+    let next = book.next_remaining();
+    for (idx, block) in book.blocks.iter().enumerate() {
         let start = lines.len();
+        if book.cell_meta(idx).is_some() {
+            let mut label = format!("cell {}", book.cell_label(idx));
+            if let Some(prerequisite) = book.blocked_by(idx) {
+                label.push_str(&format!(" · blocked by {}", book.cell_label(prerequisite)));
+            } else if next == Some(idx)
+                && !matches!(block, BookBlock::Code(c) if c.state == CodeBlockState::Running)
+            {
+                label.push_str(" · next");
+            }
+            lines.extend(wrap(&[Span::raw(label).dim()], w));
+        }
         match block {
             BookBlock::Md(node) => lines.extend(render_md(node, w)),
             BookBlock::Code(c) => lines.extend(code_lines(c, w, verbose)),
@@ -1364,5 +1376,29 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
             lines.iter().any(|l| line_text(l).contains("yes")),
             "answered value not shown"
         );
+    }
+
+    #[test]
+    fn document_shows_actionable_ordinals_and_current_prerequisite_status() {
+        let doc = "# Prose\n\n```sh skip=true\nexample\n```\n\n```sh id=prepare\ntrue\n```\n\n```sh id=use needs=prepare\ntrue\n```";
+        let mut book = Runbook::new(None::<&str>, doc).unwrap();
+        let render = |book: &Runbook| {
+            build_document(book, 80, false)
+                .0
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let text = render(&book);
+        assert!(text.contains("cell #1 (prepare) · next"));
+        assert!(text.contains("cell #2 (use) · blocked by #1 (prepare)"));
+        let idx = book.resolve_cell("prepare").unwrap();
+        if let BookBlock::Code(c) = &mut book.blocks[idx] {
+            c.finish(true, Some(0));
+        }
+        let text = render(&book);
+        assert!(text.contains("cell #2 (use) · next"));
+        assert!(!text.contains("blocked by"));
     }
 }

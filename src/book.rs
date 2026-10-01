@@ -103,6 +103,7 @@ impl Runbook {
                             .with_context(|| format!("{location}: input '{}'", mib.target()))?;
                         let mut cell = InputCell::new(mib);
                         cell.location = Some(location);
+                        cell.meta = b.meta;
                         return Ok(BookBlock::Input(cell));
                     }
 
@@ -114,7 +115,7 @@ impl Runbook {
             .collect::<Result<Vec<_>>>()?;
 
         // Done!
-        Ok(Self {
+        let book = Self {
             path,
             frontmatter,
             blocks,
@@ -123,7 +124,9 @@ impl Runbook {
             tmp_guard: None,
             source: doc.to_string(),
             cli_env: HashMap::new(),
-        })
+        };
+        book.validate_execution()?;
+        Ok(book)
     }
 
     /// Mutable access to the input cell at `idx`, if that block is one.
@@ -662,6 +665,12 @@ pub struct TmpDirConf {
 /// rather than just combining them.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct CodeBlockMeta {
+    /// Stable reference for a runnable or input cell.
+    pub id: Option<String>,
+
+    /// Comma-separated references to earlier prerequisite cells.
+    pub needs: Option<String>,
+
     /// Special config field
     ///
     /// For now, just used with `lang=json`
@@ -818,6 +827,7 @@ impl MagicInputBlock {
 /// state that lives here only while the cell is focused.
 #[derive(Debug)]
 pub struct InputCell {
+    pub meta: CodeBlockMeta,
     pub config: MagicInputBlock,
     pub state: InputState,
     /// Resolved select options: the inline `options` list followed by any lines
@@ -1010,6 +1020,7 @@ impl InputCell {
             _ => (Vec::new(), None),
         };
         Self {
+            meta: CodeBlockMeta::default(),
             config,
             state: InputState::Pending,
             loaded_options,
@@ -1544,6 +1555,20 @@ env:
     #[test]
     fn pending_has_no_resolution() {
         assert!(confirm().resolved().is_none());
+    }
+
+    #[test]
+    fn empty_selection_submission_keeps_the_editor_pending() {
+        let mut cell = InputCell::new(
+            serde_json::from_str(
+                r#"{"type":"select","prompt":"?","target":"CHOICE","options":[]}"#,
+            )
+            .unwrap(),
+        );
+        cell.begin_edit(&HashMap::new());
+        assert!(cell.submit().is_err());
+        assert!(cell.is_editing());
+        assert!(cell.resolved().is_none());
     }
 
     #[test]
