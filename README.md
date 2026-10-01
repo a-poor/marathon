@@ -133,12 +133,21 @@ fi
 `default` is optional: a string for text/selection, a boolean for confirmation.
 A selection default is an option's value, not its index. Confirmations export
 `yes` or `no`; a `no` answer does not stop execution by itself—branch on it in shell.
+Input targets, frontmatter `env` keys, `tmp_dir.var_name`, and CLI `--env` keys must
+match `[A-Za-z_][A-Za-z0-9_]*`. Answers, defaults, and options cannot contain NUL
+characters, which cannot be passed in an environment variable.
 
 Selections can also use `"option_file":"$TMP_DIR/choices.txt"`. File lines are
 trimmed, blank lines omitted, and entries appended to any inline `options`.
 `$NAME` and `${NAME}` in the path resolve against the cell's environment; there is
 no command substitution. Files are re-read when the input is reached/edited, so an
-earlier cell can generate them. CLI execution reports unreadable option files.
+earlier cell can generate them. Both CLI and TUI report unreadable files, even
+when inline choices are present, and reject selections with no available options.
+In the TUI, an error stays with the input and Enter cannot advance until the answer
+is valid. Press Esc, fix the file or run its generating cell, then reopen the input
+to retry. If a refreshed file removes a previous answer or default, choose an
+available option explicitly; Marathon does not silently substitute the first one.
+Canceling restores a previous answer only if it is still valid after the refresh.
 
 ## CLI execution
 
@@ -163,6 +172,8 @@ validated and used without prompting in either mode. Otherwise interactive mode
 prompts, using the explicit default when you press Enter. With no explicit default,
 interactive confirmation starts at `no`; text may be empty; selection requires a
 choice. The TUI seeds editors from defaults but lets you answer each input directly.
+If a generated file makes a selection default invalid, interactive CLI execution
+reports it and asks for a choice; `--yes` requires a valid supplied value instead.
 
 Cell stdout and stderr are combined on **stdout**. Shell streams preserve written
 order, and CLI output preserves bytes exactly—including CRLF, binary data, and a
@@ -216,8 +227,13 @@ marathon skills install --project  # install bundled runbook-authoring guidance
 marathon completions zsh           # also bash, fish, elvish, powershell
 ```
 
-Validation checks Markdown configuration and JSON input shapes; it does not verify
-shell syntax, interpreter availability, or option files that may be generated later.
+Validation checks Markdown configuration, JSON input shapes, environment targets,
+and defaults. Inline-only selections need at least one option and any default must
+match an option. Diagnostics identify the source file, fence line/column, and cell
+number (counting top-level code blocks). Unrelated frontmatter fields are accepted.
+Validation does not read option files or check defaults against their contents;
+those checks wait until the input is reached. It also does not verify shell syntax
+or interpreter availability.
 
 The Homebrew cask installs completions automatically. For other installations:
 

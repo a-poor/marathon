@@ -18,9 +18,14 @@ unlabeled fences, and indented code are display-only. Nested Markdown is prose,
 not a nested execution graph. Frontmatter fields are documented in the README.
 Unknown frontmatter fields are tolerated for compatibility with other Markdown tools.
 
-`validate` parses Markdown, YAML, fence metadata, and input JSON. It does not
-execute commands, validate shell syntax, check installed interpreters, or require
-option files that a preceding cell may produce.
+`validate` parses Markdown, YAML, fence metadata, and input JSON. It checks shell
+environment names (`[A-Za-z_][A-Za-z0-9_]*`) for input targets, frontmatter `env` keys,
+and `tmp_dir.var_name`; CLI `--env` uses the same rule. Environment values cannot
+contain NUL. Inline-only selections must have options and a default, if present,
+must match an option. Errors include source locations and code-block ordinals.
+It does not execute commands, validate shell syntax, check installed interpreters,
+or read option files. File-dependent choices/defaults are checked on reaching the
+input, even when a literal file path already exists during parsing.
 
 ## 2. Processes and shared state
 
@@ -60,13 +65,23 @@ always user-owned and are never removed, including on reset.
 Selections combine inline `options` and lines read from `option_file`. File lines
 are trimmed and blank lines omitted. `$NAME`/`${NAME}` in paths expand against the
 cell environment; unknown references remain literal, `$$` yields `$`, and no shell
-substitution is performed. Options are refreshed when an input is reached/edited.
-CLI reads are strict; TUI loading is currently best-effort.
+substitution is performed. Options are refreshed when an input is reached/edited,
+against the full cell environment including inherited variables. The scratch
+directory is initialized before input editing as well as code execution. Reads
+are strict in both CLI and TUI: unreadable files discard cached choices and block
+answers even if inline choices exist. Empty combined choices also block answers.
 
 Input state is pending, editing (draft plus prior answer), or answered. In the TUI,
-explicit defaults seed the editor; cancellation restores the prior answer. CLI
-answers use the same answered state. A confirmation is data, not a control-flow
-gate: shell code must branch on the exported `yes`/`no` value.
+explicit defaults seed the editor; cancellation restores the prior answer only if
+it remains valid after options are refreshed. CLI answers and TUI submissions use
+one validation boundary. Failed submissions retain the draft and focus, display
+an inline error, and do not advance selection or export an answer. A default or
+prior answer absent from refreshed choices leaves no highlighted choice until the
+user selects one. Esc followed by reopening retries option loading. Interactive
+CLI execution reports invalid file-dependent defaults and prompts without a
+default; unattended execution requires a valid default or supplied value.
+A confirmation is data, not a control-flow gate: shell code must branch on the
+exported `yes`/`no` value.
 
 ## 4. Owning a run
 

@@ -19,6 +19,12 @@ printf 'east\nwest\ncentral\n' > "$TMP_DIR/choices.txt"
 
 ## Choose a region
 
+Run the preceding cell before opening this input. `marathon validate` accepts the
+generated file path without reading it. If you open the input too early in the
+TUI, it shows a file error and keeps the input unanswered: press Esc, run the
+generating cell, then reopen the input. An empty or unreadable options file also
+blocks submission. The default `west` must be one of the generated choices.
+
 ```json mrthn=input
 {
   "type": "select",
