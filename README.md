@@ -231,6 +231,13 @@ implementation contracts, and [TODO.md](TODO.md) for remaining work.
 
 ## Development
 
+[CI](.github/workflows/ci.yml) runs on pushes and pull requests, and can also be
+started manually. It checks formatting on stable Rust and runs Clippy, the full
+test suite (including CLI execution and process cleanup), and the Rust 1.88.0
+minimum-version build check on both Linux and macOS.
+
+Run the same checks locally:
+
 ```sh
 cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
