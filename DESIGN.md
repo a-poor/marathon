@@ -18,6 +18,14 @@ unlabeled fences, and indented code are display-only. Nested Markdown is prose,
 not a nested execution graph. Frontmatter fields are documented in the README.
 Unknown frontmatter fields are tolerated for compatibility with other Markdown tools.
 
+Actionable cells (runnable shell and input cells) have 1-based document-order
+ordinals; prose and display-only code do not count. Fence `id` metadata gives them
+stable references: unique ASCII identifiers starting with a letter, followed by
+letters, digits, underscores, or hyphens. `needs` is a comma-separated list of IDs
+or ordinals of earlier actionable cells. References are validated at parse time;
+self/forward/unknown references are rejected, making the dependency graph acyclic.
+Execution metadata on display-only fences does not create actionable references.
+
 `validate` parses Markdown, YAML, fence metadata, and input JSON. It checks shell
 environment names (`[A-Za-z_][A-Za-z0-9_]*`) for input targets, frontmatter `env` keys,
 and `tmp_dir.var_name`; CLI `--env` uses the same rule. Environment values cannot
@@ -89,13 +97,32 @@ exported `yes`/`no` value.
 can race with another key event. It owns a task and a cancellation channel. The
 TUI stores one owner per block index; a block cannot restart or clear until its
 finished message is consumed. Reset-all is blocked while any run exists.
-Different blocks can execute concurrently in the TUI.
+Independent blocks can execute concurrently in the TUI. Every earlier input is
+an implicit prerequisite; shell prerequisites are explicit through `needs`.
+Starting code or editing inputs requires every transitive prerequisite to be
+complete (answered input or successful, uncanceled command). A prerequisite of an
+active run cannot be edited, reset, or rerun. Completed downstream records are
+not automatically invalidated when a prerequisite changes: they remain history,
+and replay requires explicit Enter or reset. No rollback is attempted.
 
 Enter starts the selected code cell and immediately selects the next runnable or
 input cell, skipping prose and display-only code. It does not start that next cell.
 Opening an input editor keeps focus in place; submitting advances, while canceling
 stays put. The last actionable cell remains selected (no wrapping). Rejected starts
-do not advance, and asynchronous completion never changes selection.
+do not advance, and manual-run completion never changes selection.
+
+`r` starts an exclusive run-remaining sequence from the first incomplete actionable
+cell, independent of selection. It requires no active manual runs, skips answered
+inputs and successful commands, and owns one command or input editor at a time.
+Only that command's Finished message (sent after process cleanup) advances the
+sequence. Input submission advances; input cancellation, loading/validation errors,
+runner errors, nonzero/signal exits, and cancellation stop it. Navigation is allowed;
+Backspace cancels the sequence's command regardless of selection. No concurrent
+manual starts, input edits, or resets are allowed while a sequence owns a cell.
+Cancellation prevents advancement even if the command subsequently exits zero.
+Input errors retain the editable draft and inline diagnostic but release sequence
+ownership; correcting the answer does not automatically resume the stopped run.
+Owners remain installed through Finished; messages without owners are ignored.
 
 On Unix each cell leads a new process group. Backspace requests SIGINT; a second
 press requests SIGKILL. A stop requested before spawn is retained. Quit, terminal
@@ -168,6 +195,9 @@ its window. Large-document layout work remains separate from output spooling.
 - `run <file>`: interactive TUI; execution order is selected by the user.
 - `exec <file>`: sequential execution, prompting before each runnable cell.
 - `exec <file> --yes`: unattended execution with supplied/default input values.
+- `exec <file> --list`: list references and prerequisites without scratch creation.
+- `exec <file> --cell REF` (repeatable): select actionable cells by ID or ordinal.
+- `exec <file> --from REF --to REF`: inclusive range; either endpoint is optional.
 - `validate <file>` / `check`: parse and summarize.
 - `new <file>`: scaffold, refusing to overwrite an existing path.
 - `completions <shell>`: generate shell completion code.
@@ -181,6 +211,27 @@ no, text accepts empty, select requires a choice). `--yes` requires an explicit
 default or supplied value and never automatically approves a confirmation.
 Selections must match available options. Missing/invalid values stop at that input;
 previous code cells may already have executed.
+
+Selection is resolved and validated before scratch creation, prompts, or commands.
+Repeated selections are deduplicated and sorted in document order; `--cell`
+conflicts with range endpoints. Every input before the last selected cell is
+included, preserving input/environment precedence, even across omitted commands.
+No later inputs are resolved. Omitted code prerequisites are reported on stderr
+and treated as externally satisfied by the caller; they are never automatically
+scheduled. Generated option files must be supplied externally or produced by a
+selected earlier command. The runner/output/signal path is shared with full runs.
+
+Recovery is session-local. The TUI retains answers, success records, and scratch
+artifacts until reset/quit. `r` resumes unfinished work using that state; a failed
+step is retried only after explicit user action. `x` clears one record, `X` clears
+all records and renews automatic scratch space, and explicit scratch directories
+remain user-owned. There is no persisted checkpoint or automatic replay. Each
+CLI invocation (including `--from`) and reopened TUI parses the document anew,
+recomputes ordinals, validates IDs/dependencies, resolves answers anew, and creates
+fresh automatic scratch space. Retained files do not restore answers/completion.
+On-disk runbook edits do not alter a live session. Any future persistent checkpoint
+must define document identity, changed-cell invalidation, secret-answer storage,
+and artifact ownership before it can safely reuse state across sessions.
 
 The CLI is fail-fast. Normal child exit codes are preserved; signaled children,
 input errors, and runner errors return 1. Ctrl-C returns 130 and Unix SIGTERM returns
@@ -198,6 +249,7 @@ longer execute as `sh`, and frontmatter is no longer mandatory.
 - `runner.rs`: process ownership, cancellation, byte streams, completion.
 - `output.rs`: disk capture ownership, incremental display decoding, bounded pages.
 - `exec.rs`: sequential CLI orchestration, prompting, input resolution.
+- `execution.rs`: cell references, selection, prerequisite and completion rules.
 - `tui.rs`: event loop, active run owners, navigation/editing, clipboard.
 - `widgets/`: Markdown rendering, wrapping, document cache, footer/help.
 - `term.rs`: shared termination-signal handling.

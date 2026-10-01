@@ -4,29 +4,11 @@ Current behavior is documented in [README.md](README.md) and [DESIGN.md](DESIGN.
 
 ## Priority workstreams
 
-The next priorities, in order, are execution controls and release checks. Keep
-runbooks ordinary Markdown and update the README, design, samples, and bundled
-authoring skill when behavior changes. Coordinate model/API changes to `book.rs`
-and `tui.rs` when working in parallel.
+The next priority is release checks. Keep runbooks ordinary Markdown and update
+the README, design, samples, and bundled authoring skill when behavior changes.
+Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 
-### 1. Execution controls and recovery
-
-- Add CLI cell/range selection and a way to start at a chosen cell, so recovering
-  from a late failure does not require replaying every earlier command. Define
-  stable cell references and how preceding inputs are resolved for partial runs.
-- Add a sequential TUI "run remaining" mode that waits for each cell, handles
-  inputs, and stops on failure or cancellation. Define how it interacts with
-  manually started concurrent runs.
-- Define prerequisite/order semantics and show blocked/next status plus run-order
-  ordinals. Today the TUI allows arbitrary order, including starting a downstream
-  cell while its prerequisite is still running.
-- Define resume/checkpoint semantics separately from merely starting at a cell:
-  which answers, completed steps, and scratch artifacts can be reused, and how
-  runbook changes affect that state. Avoid automatically replaying completed work.
-- Cover partial-run input resolution, sequential execution, failure/cancellation,
-  and existing active-run/reset/cleanup invariants with regression tests.
-
-### 2. Release checks
+### 1. Release checks
 
 - Add platform build/release smoke checks around the existing GoReleaser
   configuration.
@@ -61,6 +43,10 @@ and `tui.rs` when working in parallel.
 
 ## Deliberately deferred
 
+- Persistent cross-session checkpoints. Current recovery reuses state only in an
+  open TUI; partial CLI runs resolve inputs anew and never restore completion
+  records. Persistence needs document fingerprints, changed-step invalidation,
+  answer/secret storage, and explicit scratch-artifact ownership.
 - Python/JavaScript/SQL runners beyond shell-language remapping.
 - Live runbook reload/editing, with defined handling of active runs and existing
   answers/output when the document changes.
@@ -94,3 +80,12 @@ and `tui.rs` when working in parallel.
   windows/pages, full-output copying on demand, disk-failure diagnostics, and
   spool cleanup on rerun/reset/quit. Large-output, split-UTF-8, partial-line,
   cancellation, write-failure, and cleanup regression coverage.
+- Cell IDs and actionable ordinals, `exec --list`, `--cell`, and inclusive
+  `--from`/`--to` ranges with preceding-input resolution and no implicit replay.
+- Explicit `needs` prerequisites, TUI blocked/next status, and protection against
+  mutating prerequisites of active commands.
+- TUI `r` run-remaining with sequential cleanup, input pauses, failure/cancellation
+  stops, and reuse of session answers, successes, and scratch artifacts.
+- Regression coverage for partial selection, recovery, dependency guards, and
+  active-run/reset/cleanup invariants. Input errors stop automatic execution while
+  leaving the input editable with its inline error.

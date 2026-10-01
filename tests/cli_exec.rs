@@ -173,13 +173,30 @@ fn temporary_directory_is_cleaned_on_success_and_failure() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sigint_cleans_up_the_command_and_temp_directory() {
+    assert_sigint_cleanup(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn partial_run_sigint_cleans_up_without_starting_the_next_selected_cell() {
+    assert_sigint_cleanup(true).await;
+}
+
+#[cfg(unix)]
+async fn assert_sigint_cleanup(partial: bool) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("book.md");
     let marker = dir.path().join("survived");
     let release = dir.path().join("release");
-    std::fs::write(&path, "```sh\nprintf '%s\\n' \"$TMP_DIR\"\n(while [ ! -e \"$RELEASE\" ]; do sleep 0.05; done; touch \"$MARKER\") &\nwait\n```").unwrap();
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_marathon"))
+    let prefix = if partial {
+        "```sh\nprintf wrong; exit 99\n```\n"
+    } else {
+        ""
+    };
+    std::fs::write(&path, format!("{prefix}```sh id=live\n(printf '%s\\n' \"$TMP_DIR\"\nwhile [ ! -e \"$RELEASE\" ]; do sleep 0.05; done; touch \"$MARKER\") &\nwait\n```\n```sh\ntouch \"$MARKER\"\n```")).unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_marathon"));
+    command
         .arg("exec")
         .arg(path)
         .arg("--yes")
@@ -187,10 +204,14 @@ async fn sigint_cleans_up_the_command_and_temp_directory() {
         .env("RELEASE", &release)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
+        .kill_on_drop(true);
+    if partial {
+        command.args(["--from", "live"]);
+    }
+    let mut child = command.spawn().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    // The background descendant emits readiness after forking, so this exercises
+    // cleanup of an existing process group instead of racing the initial fork.
     let tmp = tokio::time::timeout(std::time::Duration::from_secs(3), lines.next_line())
         .await
         .unwrap()
@@ -292,7 +313,12 @@ async fn broken_stdout_pipe_cancels_the_child_and_cleans_scratch() {
 fn shipped_local_samples_run_unattended() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     // demo.md deliberately fails; shell-override and tmpdir need optional zsh/bc.
-    for sample in ["hello.md", "interactive.md", "output-spooling.md"] {
+    for sample in [
+        "hello.md",
+        "interactive.md",
+        "output-spooling.md",
+        "execution-controls.md",
+    ] {
         let doc = std::fs::read_to_string(root.join("samples").join(sample)).unwrap();
         let output = exec(&doc, &["--yes"], "");
         assert!(output.status.success(), "{sample}: {:?}", output);
@@ -467,4 +493,154 @@ fn large_output_still_streams_exact_bytes_without_tui_conversion() {
     assert_eq!(&output.stdout[12..12 + 4194304], vec![0; 4194304]);
     assert!(output.stdout.ends_with(b"\xe2\x82\xac\xffend"));
     assert_eq!(output.stdout.len(), 12 + 4194304 + 7);
+}
+
+const PARTIAL: &str = r#"
+# Prose does not count
+```sh id=setup
+printf setup
+```
+```sh skip=true
+echo wrong
+```
+```json mrthn=input id=label
+{"type":"input","prompt":"Label?","target":"MRTHN_TEST_PARTIAL","default":"demo"}
+```
+```sh id=work needs=setup,label
+printf 'work:%s' "$MRTHN_TEST_PARTIAL"
+```
+```sh id=finish needs=work
+printf finish
+```
+```json mrthn=input id=unused
+{"type":"input","prompt":"Unused?","target":"MRTHN_TEST_UNUSED"}
+```
+"#;
+
+#[test]
+fn partial_runs_select_ids_ordinals_and_inclusive_ranges_in_document_order() {
+    for (args, expected) in [
+        (vec!["--cell", "work"], "work:demo"),
+        (
+            vec!["--cell", "4", "--cell", "work", "--cell", "3"],
+            "work:demofinish",
+        ),
+        (vec!["--from", "work", "--to", "finish"], "work:demofinish"),
+        (vec!["--to", "3"], "setupwork:demo"),
+        (vec!["--cell", "label"], ""),
+    ] {
+        let mut flags = vec!["--yes"];
+        flags.extend(args);
+        let output = exec(PARTIAL, &flags, "");
+        assert!(output.status.success(), "{flags:?}: {output:?}");
+        assert_eq!(output.stdout, expected.as_bytes(), "{flags:?}");
+    }
+}
+
+#[test]
+fn partial_runs_resolve_preceding_inputs_interactively_or_from_environment() {
+    let output = exec(PARTIAL, &["--cell", "work"], "chosen\nyes\n");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"work:chosen");
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostic.contains("skipped prerequisites #1 (setup)"));
+    assert!(diagnostic.contains("cell #3 (work)"));
+    let output = exec(
+        PARTIAL,
+        &[
+            "--cell",
+            "work",
+            "--yes",
+            "-e",
+            "MRTHN_TEST_PARTIAL=supplied",
+        ],
+        "",
+    );
+    assert_eq!(output.stdout, b"work:supplied");
+}
+
+#[test]
+fn invalid_selection_is_rejected_before_any_execution() {
+    for args in [
+        vec!["--cell", "setup", "--cell", "missing"],
+        vec!["--from", "0"],
+        vec!["--from", "999999999999999999999999999999"],
+        vec!["--from", "finish", "--to", "setup"],
+        vec!["--cell", "setup", "--from", "work"],
+        vec!["--list", "--cell", "work"],
+    ] {
+        let mut flags = vec!["--yes"];
+        flags.extend(args);
+        let output = exec(PARTIAL, &flags, "");
+        assert!(!output.status.success(), "{flags:?}");
+        assert!(output.stdout.is_empty(), "{flags:?}");
+    }
+}
+
+#[test]
+fn listing_references_never_creates_scratch_or_prompts() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let scratch = dir.path().join("scratch");
+    let doc = format!(
+        "---\ntmp_dir:\n  path: {}\n---\n{PARTIAL}",
+        scratch.display()
+    );
+    let output = exec(&doc, &["--list"], "");
+    assert!(output.status.success(), "{output:?}");
+    assert!(!scratch.exists());
+    let listing = String::from_utf8(output.stdout).unwrap();
+    assert!(listing.contains("#1 (setup)  sh"));
+    assert!(listing.contains("#3 (work)  sh — needs #1 (setup), #2 (label)"));
+    assert_eq!(listing.lines().count(), 5);
+}
+
+#[test]
+fn partial_run_does_not_replay_option_file_producer() {
+    let doc = r#"
+```sh id=prepare
+printf 'west\n' > "$TMP_DIR/options"
+```
+```json mrthn=input id=region needs=prepare
+{"type":"select","prompt":"Region?","target":"MRTHN_TEST_REGION","option_file":"$TMP_DIR/options","default":"west"}
+```
+```sh id=use
+printf '%s' "$MRTHN_TEST_REGION"
+```
+"#;
+    let output = exec(doc, &["--from", "use", "--yes"], "");
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("cell #2 (region)"));
+    assert!(error.contains("reading option file"));
+
+    // Recovery can explicitly reuse user-owned artifacts without replaying setup.
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(dir.path().join("options"), "west\n").unwrap();
+    let doc = format!(
+        "---\ntmp_dir:\n  path: {}\n---\n{doc}",
+        dir.path().display()
+    );
+    let output = exec(&doc, &["--from", "use", "--yes"], "");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"west");
+    assert!(dir.path().join("options").exists());
+}
+
+#[test]
+fn partial_run_input_failure_and_command_failure_stop_the_selection() {
+    let output = exec(
+        INPUTS,
+        &["--from", "4", "--yes", "-e", "MRTHN_TEST_REGION=invalid"],
+        "",
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let output = exec(
+        "```sh\nprintf skipped\n```\n```sh id=fail\nprintf failed; exit 17\n```\n```sh\nprintf wrong\n```",
+        &["--from", "fail", "--yes"],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(17));
+    assert_eq!(output.stdout, b"failed");
 }

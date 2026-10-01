@@ -55,6 +55,8 @@ pub struct App {
     last_finish: Option<(Status, std::time::Instant)>,
     /// One owner per running cell, inserted before its task can emit output.
     runs: HashMap<usize, runner::RunningCell>,
+    /// Cell currently owned by run-remaining, including a paused input editor.
+    sequence: Option<usize>,
     /// The system clipboard handle, opened once at startup (held alive so the
     /// clipboard persists on platforms that serve it from the owning process, e.g.
     /// X11). `None` if the platform has no clipboard available.
@@ -86,6 +88,7 @@ impl App {
             flash: None,
             last_finish: None,
             runs: HashMap::new(),
+            sequence: None,
             clipboard: arboard::Clipboard::new().ok(),
             run_tx,
             run_rx,
@@ -135,6 +138,7 @@ impl App {
     }
 
     async fn shutdown_runs(&mut self) {
+        self.sequence = None;
         self.run_rx.close();
         for run in self.runs.values() {
             run.cancel(true);
@@ -185,7 +189,10 @@ impl App {
         };
 
         let hints = match self.mode {
-            Mode::Navigate => Line::from("↑/↓ move • ↵ run • q quit • ? help"),
+            Mode::Navigate if self.sequence.is_some() => {
+                Line::from("running remaining • backspace stop • q quit")
+            }
+            Mode::Navigate => Line::from("↑/↓ move • ↵ run • r remaining • ? help"),
             Mode::Active => Line::from("↵ submit • esc cancel • ←/→ edit"),
         };
 
@@ -288,6 +295,7 @@ impl App {
                 self.scroll.scroll_up(page)
             }
             (KeyCode::Enter, _) => self.activate_or_run(),
+            (KeyCode::Char('r'), _) => self.run_remaining(),
             (KeyCode::Backspace, _) => self.cancel_selected(),
             (KeyCode::Char('y'), _) => self.copy_selected(),
             (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
@@ -310,6 +318,9 @@ impl App {
         let Some(idx) = self.selected_block() else {
             return; // header selected: nothing to activate
         };
+        if !self.can_change(idx) {
+            return;
+        }
         let started = match self.book.blocks.get(idx) {
             Some(BookBlock::Input(_)) => {
                 self.activate_selected();
@@ -320,6 +331,73 @@ impl App {
         };
         if started {
             self.select_next_cell(idx);
+        }
+    }
+
+    fn notice(&mut self, message: impl Into<String>) {
+        self.flash = Some((message.into(), std::time::Instant::now()));
+    }
+
+    fn can_change(&mut self, idx: usize) -> bool {
+        if self.sequence.is_some() {
+            self.notice("stop run remaining before changing cells");
+            return false;
+        }
+        if self.runs.contains_key(&idx) {
+            self.notice("cancel the running cell before changing it");
+            return false;
+        }
+        if let Some(&dependent) = self
+            .runs
+            .keys()
+            .find(|&&run| self.book.depends_on(run, idx))
+        {
+            self.notice(format!(
+                "cell {} is using this prerequisite",
+                self.book.cell_label(dependent)
+            ));
+            return false;
+        }
+        true
+    }
+
+    fn is_blocked(&mut self, idx: usize) -> bool {
+        if let Some(prerequisite) = self.book.blocked_by(idx) {
+            self.notice(format!(
+                "blocked: complete cell {} first",
+                self.book.cell_label(prerequisite)
+            ));
+            return true;
+        }
+        false
+    }
+
+    /// Exclusive sequential ownership: never adopt or overlap manually started runs.
+    fn run_remaining(&mut self) {
+        if self.sequence.is_some() || !self.runs.is_empty() {
+            self.notice("wait for or cancel active runs before running remaining");
+            return;
+        }
+        self.advance_remaining();
+    }
+
+    fn advance_remaining(&mut self) {
+        if self.exit {
+            return;
+        }
+        let Some(idx) = self.book.next_remaining() else {
+            self.notice("all cells complete");
+            return;
+        };
+        self.scroll.select_index(idx + 1, self.selectable_count());
+        self.sequence = Some(idx);
+        let started = match &self.book.blocks[idx] {
+            BookBlock::Input(_) => self.activate_selected(),
+            BookBlock::Code(_) => self.run_selected(idx),
+            _ => false,
+        };
+        if !started {
+            self.sequence = None;
         }
     }
 
@@ -425,11 +503,7 @@ impl App {
         let Some(idx) = self.selected_block() else {
             return;
         };
-        if self.runs.contains_key(&idx) {
-            self.flash = Some((
-                "cancel the running cell before clearing it".into(),
-                std::time::Instant::now(),
-            ));
+        if !self.can_change(idx) {
             return;
         }
         match self.book.blocks.get_mut(idx) {
@@ -446,7 +520,7 @@ impl App {
     /// `X`: reset every cell (all code outputs and input answers). Also discards the
     /// temp dir and mints a fresh one, kept visible in the header from the next frame.
     fn clear_all(&mut self) {
-        if !self.runs.is_empty() {
+        if !self.runs.is_empty() || self.sequence.is_some() {
             self.flash = Some((
                 "cancel running cells before resetting".into(),
                 std::time::Instant::now(),
@@ -459,18 +533,29 @@ impl App {
     }
 
     /// Enter edit mode on the selected cell, if it is an input cell.
-    fn activate_selected(&mut self) {
+    fn activate_selected(&mut self) -> bool {
         let Some(idx) = self.selected_block() else {
-            return;
+            return false;
         };
+        if self.is_blocked(idx) {
+            return false;
+        }
         if self.book.input_at_mut(idx).is_some() {
             if let Err(error) = self.book.begin_edit_at(idx) {
                 self.flash = Some((format!("{error:#}"), std::time::Instant::now()));
-                return;
+                return false;
             }
             self.mode = Mode::Active;
             self.revision += 1;
+            // Keep validation errors editable inline, but release sequence ownership
+            // so fixing an input cannot silently restart automatic execution.
+            return self.sequence != Some(idx)
+                || self
+                    .book
+                    .input_at_mut(idx)
+                    .is_some_and(|cell| cell.error().is_none());
         }
+        false
     }
 
     /// Spawn the code cell at `idx`: mark it Running now, build its interpreter +
@@ -478,6 +563,9 @@ impl App {
     /// Return whether a new run was scheduled, so rejected runs do not advance.
     fn run_selected(&mut self, idx: usize) -> bool {
         if self.runs.contains_key(&idx) {
+            return false;
+        }
+        if self.is_blocked(idx) {
             return false;
         }
         // TMP_DIR must exist before we build the env map that references it.
@@ -528,7 +616,13 @@ impl App {
     /// hits the whole process group, so the shell *and* anything it spawned get it. A
     /// no-op if nothing is running there.
     fn cancel_selected(&mut self) {
-        let Some(idx) = self.selected_block() else {
+        // Stop the sequence regardless of where the user has scrolled/selected.
+        let current = self.sequence.take();
+        if let Some(idx) = current {
+            self.scroll.select_index(idx + 1, self.selectable_count());
+            self.notice("run remaining stopped");
+        }
+        let Some(idx) = current.or_else(|| self.selected_block()) else {
             return;
         };
         let Some(run) = self.runs.get(&idx) else {
@@ -562,12 +656,18 @@ impl App {
 
     /// Fold a streamed run message back into the document.
     fn apply_run_msg(&mut self, msg: RunMsg) {
+        let idx = match &msg {
+            RunMsg::Output { idx, .. }
+            | RunMsg::Captured { idx }
+            | RunMsg::Finished { idx, .. } => *idx,
+        };
+        // Owners remain installed through Finished, so stale output cannot attach
+        // to a cleared cell or trigger another step.
+        if !self.runs.contains_key(&idx) {
+            return;
+        }
         match msg {
-            RunMsg::Captured { idx } => {
-                if !self.runs.contains_key(&idx) {
-                    return;
-                }
-            }
+            RunMsg::Captured { .. } => {}
             RunMsg::Output { .. } => unreachable!("TUI output is spooled by the runner"),
             RunMsg::Finished {
                 idx,
@@ -575,6 +675,8 @@ impl App {
                 code,
                 error,
             } => {
+                let canceled = matches!(&self.book.blocks[idx], BookBlock::Code(c) if c.cancel != Cancel::None);
+                let success = success && !canceled && error.is_none();
                 if let Some(BookBlock::Code(c)) = self.book.blocks.get_mut(idx) {
                     if let Some(error) = error {
                         c.error = Some(format!("failed to run: {error}"));
@@ -585,6 +687,18 @@ impl App {
                 // Record the latest outcome so the badge can briefly reveal it.
                 let state = if success { Status::Done } else { Status::Error };
                 self.last_finish = Some((state, std::time::Instant::now()));
+                if self.sequence == Some(idx) {
+                    self.sequence = None;
+                    if self.book.cell_complete(idx) {
+                        self.advance_remaining();
+                    } else {
+                        self.scroll.select_index(idx + 1, self.selectable_count());
+                        self.notice(format!(
+                            "run remaining stopped at {}",
+                            self.book.cell_label(idx)
+                        ));
+                    }
+                }
             }
         }
         // Either way the cell's rendered lines changed; invalidate the cache. The
@@ -608,12 +722,19 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 cell.cancel();
+                self.sequence = None;
                 self.mode = Mode::Navigate;
             }
             KeyCode::Enter => {
                 if cell.submit().is_ok() {
                     self.mode = Mode::Navigate;
-                    self.select_next_cell(idx);
+                    if self.sequence.take().is_some() {
+                        self.advance_remaining();
+                    } else {
+                        self.select_next_cell(idx);
+                    }
+                } else {
+                    self.sequence = None;
                 }
             }
             code => match &cell.config {
@@ -671,6 +792,211 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    #[tokio::test]
+    async fn remaining_waits_for_completion_pauses_for_input_and_reuses_session() {
+        let doc = r#"
+```sh id=prepare
+printf 'west\n' > "$TMP_DIR/options"
+printf prepared
+```
+```json mrthn=input id=region needs=prepare
+{"type":"select","prompt":"Region?","target":"REGION","option_file":"$TMP_DIR/options"}
+```
+```sh id=use needs=prepare,region
+printf '%s' "$REGION"
+```
+"#;
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.sequence, Some(0));
+        assert_eq!(app.runs.len(), 1);
+        let scratch = app.book.tmp_dir.clone().unwrap();
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.runs.len(),
+            1,
+            "manual execution cannot overlap the queue"
+        );
+        app.clear_selected();
+        app.clear_all();
+        assert_eq!(app.book.tmp_dir.as_ref(), Some(&scratch));
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        assert_eq!(app.sequence, Some(1));
+        assert_eq!(app.mode, Mode::Active);
+        assert_eq!(app.selected_block(), Some(1));
+        assert_eq!(app.book.input_at_mut(1).unwrap().options(), ["west"]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.sequence, Some(2));
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        assert!(app.sequence.is_none());
+        assert_eq!(app.book.output_text(2).unwrap().as_deref(), Some("west"));
+        // Pressing r again preserves completed work, answers, and scratch artifacts.
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.runs.is_empty());
+        assert_eq!(app.book.tmp_dir.as_ref(), Some(&scratch));
+        assert_eq!(
+            app.book.output_text(0).unwrap().as_deref(),
+            Some("prepared")
+        );
+        assert!(scratch.join("options").exists());
+        app.shutdown_runs().await;
+        drop(app);
+        assert!(!scratch.exists());
+    }
+
+    #[tokio::test]
+    async fn remaining_stops_on_failure_and_retries_only_unfinished_work() {
+        let doc = "```sh\necho once >> \"$TMP_DIR/log\"\n```\n\
+                   ```sh\nif [ ! -e \"$TMP_DIR/attempt\" ]; then touch \"$TMP_DIR/attempt\"; exit 9; fi\n```\n\
+                   ```sh\ncat \"$TMP_DIR/log\"\n```";
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        press(&mut app, KeyCode::Char('r'));
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        assert_eq!(app.selected_block(), Some(1));
+        assert!(app.sequence.is_none());
+        assert_eq!(app.book.run_counts().succeeded, 1);
+        assert!(app.book.output_text(2).unwrap().is_none());
+        press(&mut app, KeyCode::Char('r'));
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        assert_eq!(app.book.run_counts().succeeded, 3);
+        assert_eq!(app.book.output_text(2).unwrap().as_deref(), Some("once\n"));
+        app.shutdown_runs().await;
+    }
+
+    #[tokio::test]
+    async fn remaining_cannot_adopt_manual_runs_and_cancellation_stops_the_queue() {
+        let doc = "```sh\nsleep 10\n```\n```sh\nprintf wrong\n```";
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        app.scroll.select_index(1, app.selectable_count());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.sequence.is_none());
+        app.scroll.select_index(1, app.selectable_count());
+        press(&mut app, KeyCode::Backspace);
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.selected_block(), Some(0));
+        assert!(app.sequence.is_none());
+        press(&mut app, KeyCode::Char('r'));
+        assert!(
+            app.sequence.is_none(),
+            "must drain cancellation before restarting"
+        );
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        assert!(!app.book.cell_complete(0));
+        assert!(app.book.output_text(1).unwrap().is_none());
+        app.shutdown_runs().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn canceled_command_exiting_zero_does_not_count_as_complete() {
+        let doc = "```sh\ntrap 'exit 0' INT\nprintf ready\nwhile :; do sleep 0.05; done\n```\n```sh\nprintf wrong\n```";
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        press(&mut app, KeyCode::Char('r'));
+        next(&mut app).await;
+        press(&mut app, KeyCode::Backspace);
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        assert!(!app.book.cell_complete(0));
+        assert!(app.sequence.is_none());
+        assert!(app.book.output_text(1).unwrap().is_none());
+        app.shutdown_runs().await;
+    }
+
+    #[tokio::test]
+    async fn prerequisites_block_downstream_runs_and_active_consumers_protect_ancestors() {
+        let doc = "```sh id=prepare\nprintf ready; sleep 10\n```\n\
+                   ```sh id=use needs=prepare\nsleep 10\n```\n\
+                   ```sh id=independent\nsleep 10\n```";
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        app.scroll.select_index(2, app.selectable_count());
+        press(&mut app, KeyCode::Enter);
+        assert!(app.runs.is_empty());
+        assert_eq!(app.selected_block(), Some(1));
+        app.scroll.select_index(1, app.selectable_count());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.runs.len(), 1);
+        app.scroll.select_index(3, app.selectable_count());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.runs.len(), 2, "independent manual runs can overlap");
+        app.shutdown_runs().await;
+
+        let doc = "```sh id=prepare\nprintf ready\n```\n```sh needs=prepare\nprintf started; sleep 10\n```";
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        app.scroll.select_index(1, app.selectable_count());
+        press(&mut app, KeyCode::Enter);
+        while !app.runs.is_empty() {
+            next(&mut app).await;
+        }
+        press(&mut app, KeyCode::Enter);
+        app.scroll.select_index(1, app.selectable_count());
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.runs.len(), 1);
+        assert!(app.book.cell_complete(0));
+        assert_eq!(app.book.output_text(0).unwrap().as_deref(), Some("ready"));
+        app.shutdown_runs().await;
+    }
+
+    #[test]
+    fn remaining_input_cancel_and_load_errors_never_advance() {
+        for config in [
+            r#"{"type":"select","prompt":"?","target":"CHOICE","option_file":"$TMP_DIR/empty"}"#,
+            r#"{"type":"select","prompt":"?","target":"CHOICE","options":["a"],"option_file":"$TMP_DIR/missing"}"#,
+            r#"{"type":"select","prompt":"?","target":"CHOICE","default":"missing","option_file":"$TMP_DIR/choices"}"#,
+        ] {
+            let doc = format!("```json mrthn=input\n{config}\n```\n```sh\necho wrong\n```");
+            let mut app = App::new(Runbook::new(None::<&str>, &doc).unwrap());
+            let scratch = app.book.ensure_tmp_dir().unwrap();
+            std::fs::write(scratch.join("empty"), "").unwrap();
+            std::fs::write(scratch.join("choices"), "available\n").unwrap();
+            press(&mut app, KeyCode::Char('r'));
+            assert!(app.sequence.is_none());
+            assert!(app.runs.is_empty());
+            assert_eq!(app.selected_block(), Some(0));
+            assert!(app.book.input_at_mut(0).unwrap().resolved().is_none());
+            assert_eq!(app.mode, Mode::Active);
+            assert!(app.book.input_at_mut(0).unwrap().error().is_some());
+            if config.contains("default") {
+                press(&mut app, KeyCode::Down);
+                press(&mut app, KeyCode::Enter);
+                assert!(app.book.cell_complete(0));
+                assert_eq!(app.mode, Mode::Navigate);
+                assert!(
+                    app.runs.is_empty(),
+                    "fixing an input must not restart the stopped sequence"
+                );
+            }
+        }
+        let doc = "```json mrthn=input\n{\"type\":\"input\",\"prompt\":\"?\",\"target\":\"ANSWER\"}\n```\n```sh\necho wrong\n```";
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.sequence, Some(0));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.sequence.is_none());
+        assert_eq!(app.mode, Mode::Navigate);
+        assert!(app.runs.is_empty());
+        assert!(app.book.input_at_mut(0).unwrap().resolved().is_none());
     }
 
     #[tokio::test]
@@ -985,31 +1311,41 @@ mod tests {
 
     #[tokio::test]
     async fn spool_write_failure_stops_run_and_keeps_diagnostic_out_of_output() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let release = dir.path().join("release");
-        let mut app = app(
-            "printf ready; while [ ! -e \"$RELEASE\" ]; do sleep 0.01; done; while :; do printf more; done",
-        );
-        app.book
-            .cli_env
-            .insert("RELEASE".into(), release.display().to_string());
-        app.activate_or_run();
-        next(&mut app).await;
-        let capture = capture(&app);
-        assert_eq!(capture.text().unwrap(), "ready");
-        capture.fail_writes();
-        std::fs::write(release, "go").unwrap();
-        while !app.runs.is_empty() {
+        for remaining in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let release = dir.path().join("release");
+            let doc = "```sh\nprintf ready; while [ ! -e \"$RELEASE\" ]; do sleep 0.01; done; while :; do printf more; done\n```\n```sh\nprintf wrong\n```";
+            let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+            app.scroll.select_index(1, app.selectable_count());
+            app.book
+                .cli_env
+                .insert("RELEASE".into(), release.display().to_string());
+            if remaining {
+                app.run_remaining();
+            } else {
+                app.activate_or_run();
+            }
             next(&mut app).await;
+            let capture = capture(&app);
+            assert_eq!(capture.text().unwrap(), "ready");
+            capture.fail_writes();
+            std::fs::write(release, "go").unwrap();
+            while !app.runs.is_empty() {
+                next(&mut app).await;
+            }
+            let BookBlock::Code(c) = &app.book.blocks[0] else {
+                panic!();
+            };
+            assert_eq!(c.state, CodeBlockState::Error);
+            assert!(c.error.as_deref().unwrap().contains("writing output spool"));
+            assert_eq!(capture.window(None, false).unwrap().text, "ready");
+            assert!(app.book.output_text(0).is_err());
+            assert!(app.sequence.is_none());
+            assert!(
+                matches!(&app.book.blocks[1], BookBlock::Code(c) if c.state == CodeBlockState::NotRun)
+            );
+            app.shutdown_runs().await;
         }
-        let BookBlock::Code(c) = &app.book.blocks[0] else {
-            panic!();
-        };
-        assert_eq!(c.state, CodeBlockState::Error);
-        assert!(c.error.as_deref().unwrap().contains("writing output spool"));
-        assert_eq!(capture.window(None, false).unwrap().text, "ready");
-        assert!(app.book.output_text(0).is_err());
-        app.shutdown_runs().await;
     }
 
     #[tokio::test]

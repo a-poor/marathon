@@ -78,7 +78,16 @@ impl Output {
 }
 
 /// Execute and fully clean up before returning an exit status to main.
-pub async fn execute(mut book: Runbook, yes: bool) -> Result<i32> {
+pub async fn execute(book: Runbook, yes: bool) -> Result<i32> {
+    execute_selected(book, yes, &crate::execution::Selection::default()).await
+}
+
+pub async fn execute_selected(
+    mut book: Runbook,
+    yes: bool,
+    selection: &crate::execution::Selection,
+) -> Result<i32> {
+    let selected = selection.resolve(&book)?;
     let mut active = None;
     let result = tokio::select! {
         biased;
@@ -86,7 +95,7 @@ pub async fn execute(mut book: Runbook, yes: bool) -> Result<i32> {
             eprintln!("✗ run interrupted");
             signal
         }
-        result = run_book(&mut book, yes, &mut active) => result,
+        result = run_book(&mut book, yes, &selected, &mut active) => result,
     };
     if let Some(run) = active.take() {
         // run_book's receiver is dropped first, unblocking any output sends.
@@ -96,28 +105,43 @@ pub async fn execute(mut book: Runbook, yes: bool) -> Result<i32> {
     result
 }
 
-async fn run_book(book: &mut Runbook, yes: bool, active: &mut Option<RunningCell>) -> Result<i32> {
+async fn run_book(
+    book: &mut Runbook,
+    yes: bool,
+    selected: &std::collections::BTreeSet<usize>,
+    active: &mut Option<RunningCell>,
+) -> Result<i32> {
     book.ensure_tmp_dir().context("creating temp dir")?;
-    let total = book
-        .blocks
-        .iter()
-        .filter(|b| matches!(b, BookBlock::Code(c) if c.is_runnable()))
-        .count();
     let mut ran = 0;
     let mut answers = Answers::default();
     let mut stdout = Output::default();
 
-    for idx in 0..book.blocks.len() {
+    for &idx in selected {
         let env = book.env_for(idx);
+        let reference = book.cell_label(idx);
+        let omitted: Vec<_> = book
+            .prerequisites(idx)
+            .into_iter()
+            .filter(|i| !selected.contains(i))
+            .map(|i| book.cell_label(i))
+            .collect();
+        if !omitted.is_empty() {
+            eprintln!(
+                "› cell {reference}: skipped prerequisites {} must already be satisfied externally",
+                omitted.join(", ")
+            );
+        }
         let input_env = if matches!(book.blocks[idx], BookBlock::Input(_)) {
             book.input_env_for(idx)
         } else {
             Default::default()
         };
         if let BookBlock::Input(cell) = &mut book.blocks[idx] {
-            cell.try_refresh_options(&input_env)?;
+            cell.try_refresh_options(&input_env)
+                .with_context(|| format!("cell {reference}"))?;
             if let Some(value) = input_env.get(cell.target()) {
-                cell.answer(value.clone())?;
+                cell.answer(value.clone())
+                    .with_context(|| format!("cell {reference}"))?;
                 eprintln!("› input '{}' — using supplied value", cell.target());
             } else if yes {
                 let value = cell.validated_default()?.ok_or_else(|| {
@@ -126,7 +150,8 @@ async fn run_book(book: &mut Runbook, yes: bool, active: &mut Option<RunningCell
                         cell.target()
                     ))
                 })?;
-                cell.answer(value)?;
+                cell.answer(value)
+                    .with_context(|| format!("cell {reference}"))?;
                 eprintln!("› input '{}' — using default", cell.target());
             } else {
                 prompt_input(cell, &mut answers)
@@ -142,7 +167,7 @@ async fn run_book(book: &mut Runbook, yes: bool, active: &mut Option<RunningCell
         if !cell.is_runnable() {
             continue;
         }
-        let label = format!("cell {}/{total} ({})", ran + 1, cell.lang);
+        let label = format!("cell {reference} ({})", cell.lang);
         let script = book.script_for(cell);
         if !yes {
             // Show the actual script, including hooks, before requesting consent.

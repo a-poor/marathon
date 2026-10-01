@@ -106,6 +106,40 @@ CLI `--env`, the scratch-directory variable, and preceding answered input cells
 `set -eu` stops on failed commands and unset variables; `pipefail` is not enabled
 by default because it is not supported by every POSIX shell.
 
+### Cell references and prerequisites
+
+Runnable shell cells and input cells have 1-based ordinals in document order.
+Prose, skipped fences, and display-only code do not count. Use
+`marathon exec book.md --list` to see the ordinals, IDs, and prerequisites without
+running commands or creating scratch space. The TUI shows the same references,
+plus `next` and `blocked by` status.
+
+Give important steps an `id` so their references survive inserted or moved cells:
+
+````markdown
+```sh id=prepare
+printf 'ready\n' > "$TMP_DIR/state"
+```
+
+```sh id=consume needs=prepare
+cat "$TMP_DIR/state"
+```
+````
+
+IDs must be unique across runnable and input cells, start with an ASCII letter,
+and contain only letters, digits, `_`, or `-`. Ordinals can change when actionable
+cells are added or removed; IDs stay stable as long as you preserve them.
+`needs=prepare,2` declares prerequisites by ID or ordinal. Each must reference an
+earlier actionable cell; unknown, self, and forward references are errors.
+Input fences also accept `id` and `needs`, for example
+`json mrthn=input id=region needs=prepare` for generated choices.
+
+Every earlier input is an implicit prerequisite because it supplies environment
+values. In the TUI, prerequisites and their ancestors must have succeeded or been
+answered before a cell can start. Independent shell cells have no implicit code
+dependencies and can still be run concurrently. Declare `needs` when commands
+share artifacts or require a particular execution order.
+
 ### Input cells
 
 Use a normal JSON fence with `mrthn=input`. Answers become environment variables:
@@ -164,7 +198,23 @@ before any subsequent cells execute. Earlier cells may already have run.
 
 ```sh
 marathon exec deploy.md --yes -e REGION=west -e PROCEED=yes > run.log
+marathon exec deploy.md --list
+marathon exec deploy.md --cell deploy --yes       # one ID (or ordinal)
+marathon exec deploy.md --from deploy --yes       # chosen cell through the end
+marathon exec deploy.md --from 3 --to 5 --yes      # inclusive range
 ```
+
+Repeat `--cell` to select several cells; they execute once each in document order,
+regardless of argument order. `--cell` cannot combine with `--from` or `--to`.
+`--to` alone starts at the beginning. All references are checked before execution.
+
+Partial runs resolve **all inputs preceding the last selected cell**, in document
+order, using the same environment/default/prompt rules as a full run. Inputs after
+that cell are ignored. Skipped shell commands are never replayed, even if declared
+as prerequisites: Marathon reports omitted prerequisites, and you are responsible
+for providing their effects. A missing generated option file still fails, even
+with a supplied answer. Select its producer too, or explicitly reuse an existing
+directory through `tmp_dir.path`.
 
 Supplied input values come from the environment available at that cell, including
 inherited variables, frontmatter, CLI overrides, and earlier answers. They are
@@ -196,7 +246,8 @@ that require an interactive terminal are not supported by the current runner.
 | `g` / `G`, Home / End | First / last cell |
 | Ctrl-U / Ctrl-D, Page Up / Page Down | Scroll half a page |
 | Enter | Run code and advance; edit an input in place, then submit and advance |
-| Backspace | Interrupt selected run; press again to force-kill it |
+| `r` | Run remaining unfinished cells sequentially, from the first unfinished cell |
+| Backspace | Stop run remaining / interrupt selected manual run; press again to force-kill it |
 | Ctrl-O | Expand/collapse output (paged for large captures) |
 | `[` / `]` | Previous / next output page of the selected cell while expanded |
 | `y` / `Y` | Copy cell source / cleaned output |
@@ -210,11 +261,43 @@ cell at the end. It happens when a run starts, without waiting for completion or
 automatically running the next cell. Use the arrow keys to return to running output
 or cancel it with Backspace. Canceling an input edit leaves that input selected.
 
-A running cell cannot be started again or cleared. Reset-all is blocked while any
-cell is running. Different cells may run concurrently; the TUI does not enforce
-execution order. Quit and terminal errors stop active processes before cleaning
+A running cell cannot be started again or cleared, and its prerequisites cannot
+be edited, rerun, or cleared until it finishes. Reset-all is blocked while any
+cell is running. Different independent cells may run concurrently. Quit and
+terminal errors stop active processes before cleaning
 scratch space. On Unix, cancellation targets the shell and descendants in its
 process group. Cells are not intended to launch persistent background services.
+
+`r` runs unfinished cells one at a time, waiting for command cleanup before
+starting the next. It pauses in the input editor when an answer is needed, then
+continues on submission. A failure, input loading/validation error, Backspace, or canceled
+input edit stops the sequence. Input errors stay editable inline; after correcting
+an answer, press `r` explicitly to continue. Backspace targets the sequence's active command
+even if you moved the selection; Esc cancels an input edit. A canceled command
+remains unfinished even if it handles the interrupt and exits successfully.
+Finish or cancel manual runs before using `r`. While a sequence is active, manual
+starts, edits, and resets are blocked; navigation and copying remain available.
+
+### Recovery and session state
+
+Within an open TUI session, `r` reuses answers, successful steps, and the same
+scratch directory. After a failure, pressing `r` explicitly retries the first
+unfinished cell and continues; it never automatically replays successful work.
+Enter explicitly reruns a selected cell. Clearing a cell with `x` makes it
+unfinished again; `X` clears all answers/results and renews automatic scratch
+space. Explicit `tmp_dir.path` directories remain user-owned on reset and quit.
+
+Completed results are history, not proof that external effects remain valid.
+Changing an earlier answer or rerunning a prerequisite does not erase completed
+downstream results. Clear or explicitly rerun those steps when their effects need
+updating. Marathon does not roll back failed or canceled commands.
+
+There are no persistent checkpoints: closing the TUI or starting another CLI
+invocation forgets answers and completion state. `--from` is a fresh partial run,
+with fresh automatic scratch space and newly resolved answers. An explicitly
+preserved directory can retain files, but does not restore completion records or
+answers. Runbooks are loaded once per session; edits on disk take effect on the
+next invocation, which revalidates references and starts with no completion state.
 
 TUI output replaces invalid UTF-8 for display, strips ANSI escapes, normalizes
 progress rewrites, and expands tabs. Full raw and cleaned captures are spooled to
