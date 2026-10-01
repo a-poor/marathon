@@ -15,6 +15,10 @@ pub const CHANNEL_CAPACITY: usize = 32;
 
 #[derive(Debug)]
 pub enum RunMsg {
+    /// A TUI capture changed on disk; carries no accumulated output.
+    Captured {
+        idx: usize,
+    },
     Output {
         idx: usize,
         chunk: Vec<u8>,
@@ -82,9 +86,49 @@ pub fn spawn_run(
     env: HashMap<String, String>,
     tx: mpsc::Sender<RunMsg>,
 ) -> RunningCell {
+    spawn_run_inner(idx, interp, script, env, tx, None)
+}
+
+/// TUI variant: spool on blocking workers and report bounded change notices.
+pub fn spawn_captured_run(
+    idx: usize,
+    interp: Vec<String>,
+    script: String,
+    env: HashMap<String, String>,
+    tx: mpsc::Sender<RunMsg>,
+    capture: crate::output::OutputCapture,
+) -> RunningCell {
+    spawn_run_inner(idx, interp, script, env, tx, Some(capture))
+}
+
+fn spawn_run_inner(
+    idx: usize,
+    interp: Vec<String>,
+    script: String,
+    env: HashMap<String, String>,
+    tx: mpsc::Sender<RunMsg>,
+    capture: Option<crate::output::OutputCapture>,
+) -> RunningCell {
     let (stop, mut rx) = watch::channel(Stop::None);
     let task = tokio::spawn(async move {
-        let result = stream_inner(idx, &interp, &script, &env, &tx, &mut rx).await;
+        let spool = capture.map(SpoolWorkers::new);
+        let result = stream_inner(idx, &interp, &script, &env, &tx, &mut rx, spool.as_ref()).await;
+        let result = if let Some(spool) = spool {
+            // A canceled pipe future can leave a blocking disk write in flight.
+            // Join these before finishing the capture or sending Finished.
+            let capture = spool.join().await;
+            let finish = tokio::task::spawn_blocking(move || capture.finish()).await;
+            match finish {
+                Ok(Ok(())) => result,
+                Ok(Err(e)) if result.is_ok() => {
+                    Err(anyhow::Error::from(e).context("finishing output spool"))
+                }
+                Err(e) => Err(anyhow::Error::from(e).context("output spool worker")),
+                _ => result,
+            }
+        } else {
+            result
+        };
         let (success, code, error) = match result {
             Ok(Some(status)) => (status.success(), status.code(), None),
             Ok(None) => (false, None, None), // canceled before spawning
@@ -98,6 +142,44 @@ pub fn spawn_run(
     RunningCell {
         stop: Some(stop),
         task: Some(task),
+    }
+}
+
+/// Own all disk jobs, including those whose awaiting pipe future was canceled.
+/// At most one write per pipe is outstanding; completed handles are pruned.
+struct SpoolWorkers {
+    capture: crate::output::OutputCapture,
+    jobs: std::sync::Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl SpoolWorkers {
+    fn new(capture: crate::output::OutputCapture) -> Self {
+        Self {
+            capture,
+            jobs: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn append(&self, chunk: Vec<u8>) -> Result<()> {
+        let capture = self.capture.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let job = tokio::task::spawn_blocking(move || {
+            let _ = tx.send(capture.append(&chunk));
+        });
+        {
+            let mut jobs = self.jobs.lock().unwrap();
+            jobs.retain(|job| !job.is_finished());
+            jobs.push(job);
+        }
+        rx.await.context("output spool worker stopped")??;
+        Ok(())
+    }
+
+    async fn join(self) -> crate::output::OutputCapture {
+        for job in self.jobs.into_inner().unwrap() {
+            let _ = job.await;
+        }
+        self.capture
     }
 }
 
@@ -166,6 +248,7 @@ async fn pump(
     mut reader: impl AsyncRead + Unpin,
     idx: usize,
     tx: &mpsc::Sender<RunMsg>,
+    capture: Option<&SpoolWorkers>,
 ) -> Result<()> {
     let mut bytes = [0; 8192];
     loop {
@@ -176,12 +259,17 @@ async fn pump(
         if n == 0 {
             return Ok(());
         }
-        tx.send(RunMsg::Output {
-            idx,
-            chunk: bytes[..n].to_vec(),
-        })
-        .await
-        .context("output receiver closed")?;
+        let chunk = bytes[..n].to_vec();
+        let msg = if let Some(capture) = capture {
+            capture
+                .append(chunk)
+                .await
+                .context("writing output spool")?;
+            RunMsg::Captured { idx }
+        } else {
+            RunMsg::Output { idx, chunk }
+        };
+        tx.send(msg).await.context("output receiver closed")?;
     }
 }
 
@@ -192,6 +280,7 @@ async fn stream_inner(
     env: &HashMap<String, String>,
     tx: &mpsc::Sender<RunMsg>,
     stop: &mut watch::Receiver<Stop>,
+    capture: Option<&SpoolWorkers>,
 ) -> Result<Option<ExitStatus>> {
     if *stop.borrow() == Stop::Kill || tx.is_closed() {
         return Ok(None);
@@ -228,7 +317,11 @@ async fn stream_inner(
                 _ => Ok(()), // an early exit may intentionally stop reading stdin
             }
         };
-        tokio::try_join!(write, pump(stdout, idx, tx), pump(stderr, idx, tx))?;
+        tokio::try_join!(
+            write,
+            pump(stdout, idx, tx, capture),
+            pump(stderr, idx, tx, capture)
+        )?;
         Ok::<_, anyhow::Error>(())
     };
     tokio::pin!(io);
@@ -301,6 +394,7 @@ pub async fn run_script(
     let mut result = Err(anyhow::anyhow!("runner ended without a result"));
     while let Some(msg) = rx.recv().await {
         match msg {
+            RunMsg::Captured { .. } => unreachable!("text adapter does not spool"),
             RunMsg::Output { chunk, .. } => output.extend(chunk),
             RunMsg::Finished { success, error, .. } => {
                 result = match error {
@@ -333,6 +427,7 @@ mod tests {
         let mut finished = None;
         while let Some(msg) = rx.recv().await {
             match msg {
+                RunMsg::Captured { .. } => unreachable!("test runner does not spool"),
                 RunMsg::Output { idx, chunk } => {
                     assert_eq!(idx, 7);
                     output.extend(chunk);

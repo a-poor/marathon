@@ -292,7 +292,7 @@ async fn broken_stdout_pipe_cancels_the_child_and_cleans_scratch() {
 fn shipped_local_samples_run_unattended() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     // demo.md deliberately fails; shell-override and tmpdir need optional zsh/bc.
-    for sample in ["hello.md", "interactive.md"] {
+    for sample in ["hello.md", "interactive.md", "output-spooling.md"] {
         let doc = std::fs::read_to_string(root.join("samples").join(sample)).unwrap();
         let output = exec(&doc, &["--yes"], "");
         assert!(output.status.success(), "{sample}: {:?}", output);
@@ -453,4 +453,18 @@ async fn ctrl_c_with_a_full_stdout_pipe_still_cleans_up() {
     assert_eq!(status.code(), Some(130));
     let scratch = std::fs::read_to_string(scratch_file).unwrap();
     assert!(!std::path::Path::new(&scratch).exists());
+}
+
+#[test]
+fn large_output_still_streams_exact_bytes_without_tui_conversion() {
+    let output = exec(
+        "```sh\nprintf '\\033[31mstart\\r\\n'; head -c 4194304 /dev/zero; printf '\\342\\202\\254\\377end'\n```",
+        &["--yes"],
+        "",
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.starts_with(b"\x1b[31mstart\r\n"));
+    assert_eq!(&output.stdout[12..12 + 4194304], vec![0; 4194304]);
+    assert!(output.stdout.ends_with(b"\xe2\x82\xac\xffend"));
+    assert_eq!(output.stdout.len(), 12 + 4194304 + 7);
 }

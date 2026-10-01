@@ -197,7 +197,8 @@ that require an interactive terminal are not supported by the current runner.
 | Ctrl-U / Ctrl-D, Page Up / Page Down | Scroll half a page |
 | Enter | Run code and advance; edit an input in place, then submit and advance |
 | Backspace | Interrupt selected run; press again to force-kill it |
-| Ctrl-O | Expand/collapse output beyond the last 25 lines |
+| Ctrl-O | Expand/collapse output (paged for large captures) |
+| `[` / `]` | Previous / next output page of the selected cell while expanded |
 | `y` / `Y` | Copy cell source / cleaned output |
 | `x` / `X` | Clear selected cell / reset all cells and automatic scratch space |
 | `?` | Show help |
@@ -216,7 +217,21 @@ scratch space. On Unix, cancellation targets the shell and descendants in its
 process group. Cells are not intended to launch persistent background services.
 
 TUI output replaces invalid UTF-8 for display, strips ANSI escapes, normalizes
-progress rewrites, and expands tabs. CLI output does none of this conversion.
+progress rewrites, and expands tabs. Full raw and cleaned captures are spooled to
+private temporary files. The inline view shows the last 25 lines within a 16 KiB
+window; even a single very long line stays bounded. Ctrl-O expands to 16 KiB pages.
+Use `[` / `]` on the selected cell to browse earlier/later pages, and the usual
+scroll keys within a page. The latest page follows new output; earlier pages stay
+put. Pages can split lines, but preserve UTF-8 characters. `Y` copies the full
+cleaned capture, allocating its text only when requested. CLI output remains raw
+and streaming.
+
+Spools are removed on rerun, clear/reset, and quit, after active processes and
+writes finish. They are separate from `$TMP_DIR` and are removed even when scratch
+cleanup is disabled. Spool creation/write failures fail the cell and stop its
+command; read/copy failures are shown in the TUI. Diagnostics are separate from
+captured output, and an incomplete capture cannot be copied as if it were complete.
+Disk use grows with output; spools are session captures, not persistent logs.
 
 ## Other commands
 

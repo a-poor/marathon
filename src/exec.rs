@@ -173,6 +173,7 @@ async fn run_book(book: &mut Runbook, yes: bool, active: &mut Option<RunningCell
         let mut outcome = None;
         while let Some(msg) = rx.recv().await {
             match msg {
+                RunMsg::Captured { .. } => unreachable!("CLI output is streamed"),
                 RunMsg::Output { chunk, .. } => {
                     stdout.write(chunk).await.context("writing cell output")?;
                 }

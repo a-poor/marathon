@@ -26,6 +26,7 @@ const SECTIONS: &[Section] = &[
             ("Enter", "run & advance · edit input"),
             ("Backspace", "cancel run (×2 to kill)"),
             ("Ctrl-o", "expand / collapse output"),
+            ("[ / ]", "previous / next output page"),
             ("y", "copy cell to clipboard"),
             ("Y", "copy cell output to clipboard"),
             ("x / X", "clear cell / clear all"),

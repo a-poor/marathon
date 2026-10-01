@@ -29,7 +29,7 @@ pub struct ScrollState {
     /// Index of the selected block (cell).
     selected: usize,
     /// Top visible line of the flattened document.
-    offset: u16,
+    offset: usize,
     /// Selection at the previous render — used to auto-scroll only when the
     /// selection *changes*, leaving free (wheel) scrolling alone otherwise.
     last_selected: Option<usize>,
@@ -83,11 +83,16 @@ impl ScrollState {
 
     /// Free line scroll (e.g. mouse wheel). Clamped to content at draw time.
     pub fn scroll_down(&mut self, n: u16) {
-        self.offset = self.offset.saturating_add(n);
+        self.offset = self.offset.saturating_add(n as usize);
     }
 
     pub fn scroll_up(&mut self, n: u16) {
-        self.offset = self.offset.saturating_sub(n);
+        self.offset = self.offset.saturating_sub(n as usize);
+    }
+
+    /// Reveal the start of the selected cell after changing its output page.
+    pub fn reveal_selected(&mut self) {
+        self.last_selected = None;
     }
 
     fn ensure_cache(&mut self, book: &Runbook, width: u16, revision: u64, verbose: bool) {
@@ -113,7 +118,7 @@ pub struct DocumentView<'a> {
     revision: u64,
     /// Whether an input cell is being actively edited — tints the highlight bar.
     active: bool,
-    /// When set, cell outputs render in full instead of the truncated tail.
+    /// When set, cell outputs render a bounded disk page instead of the tail.
     verbose: bool,
 }
 
@@ -133,7 +138,7 @@ impl<'a> DocumentView<'a> {
         self
     }
 
-    /// Expand cell outputs to their full length (vs. the default truncated tail).
+    /// Expand cell outputs to disk pages (vs. the default truncated tail).
     pub fn verbose(mut self, verbose: bool) -> Self {
         self.verbose = verbose;
         self
@@ -169,7 +174,7 @@ impl StatefulWidget for DocumentView<'_> {
         let following_run = self.book.last_run.map(|b| b + 1) == Some(selected);
 
         let changed = state.last_selected != Some(selected);
-        let mut off = state.offset as usize;
+        let mut off = state.offset;
         if changed {
             // Selection just moved: scroll the block into view. (Wheel scrolling is
             // left alone otherwise.)
@@ -193,7 +198,7 @@ impl StatefulWidget for DocumentView<'_> {
         }
         // Clamp to content.
         off = off.min(total.saturating_sub(h));
-        state.offset = off as u16;
+        state.offset = off;
         state.last_selected = Some(selected);
         state.last_selected_end = Some(range.end);
 
@@ -539,7 +544,13 @@ fn code_lines(c: &CodeBlock, width: usize, verbose: bool) -> Vec<Line<'static>> 
 
     // Result section: streamed output, then the status line as the run's
     // conclusion (so "running…" sits beneath the live output tail).
-    lines.extend(output_lines(&c.output, width, verbose));
+    match c.output.window(c.output_page, verbose) {
+        Ok(window) => lines.extend(output_lines(window, width, verbose)),
+        Err(e) => lines.extend(wrap(&[format!("output read failed: {e}").red()], width)),
+    }
+    if let Some(error) = &c.error {
+        lines.extend(wrap(&[crate::ansi::sanitize(error).red()], width));
+    }
     lines.push(status_line(c));
     lines
 }
@@ -579,47 +590,32 @@ fn gutter_color(state: CodeBlockState) -> Color {
     }
 }
 
-/// Maximum source lines of cell output shown inline unless Ctrl-O expands it.
-const OUTPUT_MAX_LINES: usize = 25;
-
-/// Render a cell's captured output on the light dotted "result" gutter, dimmed.
-/// Shows the *tail* (last [`OUTPUT_MAX_LINES`] lines) so a streaming run reveals its
-/// latest output, with a "… N earlier lines" marker when there's more above. When
-/// `verbose` (Ctrl+O), the full output is shown with no truncation or marker.
-fn output_lines(output: impl AsRef<[u8]>, width: usize, verbose: bool) -> Vec<Line<'static>> {
-    let output = String::from_utf8_lossy(output.as_ref());
-    if output.trim().is_empty() {
-        return Vec::new();
-    }
-
-    // Sanitize at the TUI boundary: strip ANSI/control bytes ratatui would render
-    // literally and corrupt the display with (DESIGN §5). Output that was *only*
-    // escapes is now empty.
-    let clean = crate::ansi::sanitize(&output);
-    if clean.trim().is_empty() {
-        return Vec::new();
-    }
-
+/// Render only a bounded, already-cleaned window of the disk capture.
+fn output_lines(
+    window: crate::output::OutputWindow,
+    width: usize,
+    verbose: bool,
+) -> Vec<Line<'static>> {
     let avail = width.saturating_sub(2).max(1);
-    let all: Vec<&str> = clean.lines().collect();
-    let hidden = if verbose {
-        0
-    } else {
-        all.len().saturating_sub(OUTPUT_MAX_LINES)
-    };
-
-    // A neutral dim bar — output is data, not a verdict, so it stays uncolored
-    // (the status line below carries the run-state tint).
     let bar = || Span::raw("┊ ").dim();
-
     let mut lines = Vec::new();
-    if hidden > 0 {
-        lines.push(Line::from(vec![
-            bar(),
-            format!("… {hidden} earlier lines").dim().italic(),
-        ]));
+    if verbose && (window.start > 0 || window.end < window.total) {
+        lines.extend(wrap(
+            &[format!(
+                "┊ output page {}/{} · [ previous / ] next",
+                window.start.div_ceil(crate::output::PAGE_BYTES) + 1,
+                window.total.div_ceil(crate::output::PAGE_BYTES),
+            )
+            .dim()],
+            width,
+        ));
+    } else if window.start > 0 {
+        lines.extend(wrap(
+            &["┊ … earlier output (Ctrl-O to expand)".dim().italic()],
+            width,
+        ));
     }
-    for line in &all[hidden..] {
+    for line in window.text.lines() {
         for chunk in hard_break(vec![Span::raw(line.to_string())], avail) {
             let mut spans = vec![bar()];
             spans.extend(chunk.into_iter().map(Stylize::dim));
@@ -1006,7 +1002,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
             unreachable!()
         };
         for i in 0..30 {
-            c.push_output(format!("line {i}\n"));
+            c.push_output(format!("line {i}\n")).unwrap();
         }
         term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 1), f.area(), &mut state))
             .unwrap();
@@ -1043,7 +1039,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
             panic!("expected a code cell");
         };
         for i in 0..30 {
-            c.push_output(format!("line {i}\n"));
+            c.push_output(format!("line {i}\n")).unwrap();
         }
         c.finish(true, Some(0));
         book.last_run = Some(0);
@@ -1070,7 +1066,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
         };
         c.state = CodeBlockState::Running;
         for i in 0..30 {
-            c.push_output(format!("line {i}\n"));
+            c.push_output(format!("line {i}\n")).unwrap();
         }
         book.last_run = Some(0);
 
@@ -1088,7 +1084,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
             unreachable!()
         };
         for i in 30..40 {
-            c.push_output(format!("line {i}\n"));
+            c.push_output(format!("line {i}\n")).unwrap();
         }
         term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 1), f.area(), &mut state))
             .unwrap();
@@ -1255,7 +1251,9 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
 
     #[test]
     fn output_rides_the_dotted_gutter() {
-        let lines = output_lines("hello world\n", 40, false);
+        let capture = crate::output::OutputCapture::default();
+        capture.append(b"hello world\n").unwrap();
+        let lines = output_lines(capture.window(None, false).unwrap(), 40, false);
         let only = line_text(&lines[0]);
         assert!(only.contains('┊'), "output lacks dotted gutter: {only}");
         assert!(only.contains("hello world"), "output text missing: {only}");
@@ -1264,14 +1262,16 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
     #[test]
     fn verbose_output_shows_all_lines_no_marker() {
         // More lines than the tail cap, so collapsed view truncates with a marker.
-        let output: String = (0..OUTPUT_MAX_LINES + 5)
+        let output: String = (0..crate::output::TAIL_LINES + 5)
             .map(|i| format!("line {i}\n"))
             .collect();
 
-        let collapsed = output_lines(&output, 40, false);
+        let capture = crate::output::OutputCapture::default();
+        capture.append(output.as_bytes()).unwrap();
+        let collapsed = output_lines(capture.window(None, false).unwrap(), 40, false);
         let collapsed_text: String = collapsed.iter().map(line_text).collect();
         assert!(
-            collapsed_text.contains("earlier lines"),
+            collapsed_text.contains("earlier output"),
             "collapsed view should mark hidden lines"
         );
         assert!(
@@ -1279,15 +1279,36 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
             "tail should hide the head"
         );
 
-        let expanded = output_lines(&output, 40, true);
+        let expanded = output_lines(capture.window(None, true).unwrap(), 40, true);
         let expanded_text: String = expanded.iter().map(line_text).collect();
         assert!(
-            !expanded_text.contains("earlier lines"),
+            !expanded_text.contains("earlier output"),
             "verbose view should have no truncation marker"
         );
         assert!(
             expanded_text.contains("line 0") && expanded_text.contains("line 29"),
             "verbose view should show the whole output"
+        );
+    }
+
+    #[test]
+    fn expanded_output_layout_is_bounded_and_reports_missing_spools() {
+        let mut c = code_cell();
+        c.push_output("x".repeat(2 * 1024 * 1024)).unwrap();
+        let lines = code_lines(&c, 80, true);
+        assert!(lines.len() < 300, "expanded capture was laid out in full");
+        assert!(
+            lines
+                .iter()
+                .map(line_text)
+                .any(|line| line.contains("output page 128/128"))
+        );
+        std::fs::remove_file(&c.output.paths()[1]).unwrap();
+        assert!(
+            code_lines(&c, 80, true)
+                .iter()
+                .map(line_text)
+                .any(|line| line.contains("output read failed"))
         );
     }
 

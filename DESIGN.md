@@ -122,15 +122,46 @@ as command output or signal termination. `run_script` is a collect-as-text libra
 adapter over the same runner, converting invalid UTF-8 lossily only at that boundary.
 
 The CLI writes command bytes unchanged to stdout. All Marathon prompts, progress,
-and errors go to stderr. The TUI accumulates bytes, decodes the full buffer for
-display/copying (preserving characters split between chunks), and sanitizes ANSI
-escapes, CR progress rewrites, tabs, and controls. It requests `NO_COLOR=1` unless
-overridden. Color rendering and PTYs are deferred.
+and errors go to stderr. CLI execution never creates output spools. The TUI
+requests `NO_COLOR=1` unless overridden; color rendering and PTYs are deferred.
 
-The TUI shows the last 25 output lines by default; Ctrl-O expands all output.
-Captured TUI output is still unbounded. A width/revision cache avoids rewrapping on
-selection changes, but content changes rebuild the whole document. These are the
-remaining large-output/large-document scaling limits.
+Each TUI run owns an `OutputCapture`: two private `NamedTempFile`s in the OS temp
+directory, one byte-exact raw capture and one incrementally cleaned UTF-8 capture.
+These are independent of scratch-directory settings, including `skip_cleanup` and
+explicit paths. The cell and active runner share ownership. Rerun/reset replaces
+the capture, and quit drops it after process cleanup and outstanding disk jobs
+have been joined. Normal final-owner drop deletes both files. As with scratch
+directories, uncatchable termination cannot guarantee named-file cleanup.
+
+The runner writes each chunk on a blocking worker, then sends a bounded
+`RunMsg::Captured` change notice. At most one write per pipe is in flight. Those
+jobs are tracked even when a cancellation drops the awaiting pipe future; cleanup
+joins them before finalizing the decoder and emitting `Finished`. Creation
+failure prevents spawn; write/finalization failure fails the run and triggers
+process cleanup. Errors remain separate from captured bytes and appear on the
+cell. Read failures appear inline or as copy diagnostics. Failed captures retain
+the available prefix for viewing, but full-text copying reports an error.
+
+The incremental display decoder retains only an incomplete UTF-8 character and
+constant escape/CR/tab state. Escape payloads are discarded without accumulation.
+CRLF becomes LF; bare CR rewinds the cleaned file to the current line's start.
+Incomplete UTF-8 waits for subsequent chunks and becomes a replacement character
+on completion. Tabs use eight-character stops after escape removal. Disk writes
+and decoding do not depend on the accumulated capture size, including long lines
+and unterminated escape sequences.
+
+Rendering reads at most 16 KiB plus three UTF-8 boundary bytes per cell. The
+collapsed window shows at most the last 25 lines; Ctrl-O shows disk pages with
+`[`/`]` navigating the selected cell. Pages may split lines but never characters,
+and need no growing in-memory line index. The latest page follows new output;
+browsing an earlier page pins its offset. `Y` reads the full cleaned capture only
+on explicit request; the clipboard API requires a full string, so copying is an
+intentional memory exception. No full raw read or repeat sanitization is needed.
+Raw bytes are also available to library callers through `raw_reader`.
+
+A width/revision cache avoids rewrapping on selection changes. Content changes
+still rebuild the document, but output contributed by each cell is bounded by
+its window. Large-document layout work remains separate from output spooling.
 
 ## 6. CLI execution
 
@@ -165,6 +196,7 @@ longer execute as `sh`, and frontmatter is no longer mandatory.
 
 - `book.rs`: parse/model, environment composition, input state, scratch lifetime.
 - `runner.rs`: process ownership, cancellation, byte streams, completion.
+- `output.rs`: disk capture ownership, incremental display decoding, bounded pages.
 - `exec.rs`: sequential CLI orchestration, prompting, input resolution.
 - `tui.rs`: event loop, active run owners, navigation/editing, clipboard.
 - `widgets/`: Markdown rendering, wrapping, document cache, footer/help.
