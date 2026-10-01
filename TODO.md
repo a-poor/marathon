@@ -5,10 +5,10 @@ Current behavior is documented in [README.md](README.md) and [DESIGN.md](DESIGN.
 ## Priority workstreams
 
 The next priorities, in order, are input correctness, output spooling, execution
-controls, and CI. Each is a separate workstream; input, output, and execution work
-share parts of `book.rs` and `tui.rs`, so coordinate model/API changes when working
-in parallel. Keep runbooks ordinary Markdown and update the README, design,
-samples, and bundled authoring skill when behavior changes.
+controls, and release checks. Each is a separate workstream; input, output, and
+execution work share parts of `book.rs` and `tui.rs`, so coordinate model/API changes
+when working in parallel. Keep runbooks ordinary Markdown and update the README,
+design, samples, and bundled authoring skill when behavior changes.
 
 ### 1. Input correctness and validation
 
@@ -51,15 +51,10 @@ samples, and bundled authoring skill when behavior changes.
 - Cover partial-run input resolution, sequential execution, failure/cancellation,
   and existing active-run/reset/cleanup invariants with regression tests.
 
-### 4. CI and release checks
+### 4. Release checks
 
-- Add checked-in CI for `cargo fmt --all -- --check`,
-  `cargo clippy --all-targets --locked -- -D warnings`,
-  `cargo test --all-targets --locked`, and
-  `cargo +1.88.0 check --all-targets --locked`.
-- Exercise supported Unix platforms (macOS and Linux), including CLI execution
-  and process-cleanup tests; add platform build/release smoke checks around the
-  existing GoReleaser configuration. No CI workflow is checked in yet.
+- Add platform build/release smoke checks around the existing GoReleaser
+  configuration.
 
 ## Reliability and portability
 
@@ -103,6 +98,9 @@ samples, and bundled authoring skill when behavior changes.
 
 ## Implemented
 
+- GitHub Actions CI for formatting on stable Rust, plus Clippy, all-target tests
+  (including CLI execution and process cleanup), and Rust 1.88.0 compatibility
+  checks on Linux and macOS.
 - CLI commands, shell completions, scaffolding, and bundled skill installation.
 - Text/confirm/select inputs, option files with environment expansion, explicit
   defaults, and input values passed to later cells.
