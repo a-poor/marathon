@@ -125,6 +125,19 @@ Three `type`s:
 - Optional `default`: a string for `input`/`select`, a boolean for `confirm`.
   Selection defaults are option values, not indexes. Defaults seed the TUI editor
   and allow `exec --yes` to answer without prompting.
+- Targets, frontmatter `env` keys, `tmp_dir.var_name`, and CLI `--env` keys must
+  match `[A-Za-z_][A-Za-z0-9_]*`; values/defaults/options cannot contain NUL.
+- Inline-only selections need at least one option and any default must match an
+  option. `validate` reports static errors with source/cell locations and accepts
+  unrelated frontmatter fields. It never reads option files: file-dependent
+  checks wait until the input is reached, so earlier cells can generate choices.
+- CLI and TUI reject unreadable option files even with inline choices, and reject
+  empty combined choices. A failed TUI answer stays editable with an inline error:
+  Esc, fix or generate the file, and reopen the input to reload. Defaults/prior
+  answers missing from refreshed choices require an explicit valid choice;
+  cancel only restores a still-valid prior answer. Interactive CLI execution
+  reports an invalid generated default and prompts for a choice; `--yes` needs a
+  valid supplied value or default.
 
 ## State model — how values reach a cell
 

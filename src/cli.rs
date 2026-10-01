@@ -133,7 +133,7 @@ pub struct NewCmd {
 }
 
 /// Parse a `KEY=VAL` pair for `--env`. The value may contain `=`; only the first
-/// splits. An empty key (e.g. `=val`) is rejected.
+/// splits. Keys must be shell environment names.
 fn parse_key_val(s: &str) -> Result<(String, String), String> {
     let (key, val) = s
         .split_once('=')
@@ -141,6 +141,7 @@ fn parse_key_val(s: &str) -> Result<(String, String), String> {
     if key.is_empty() {
         return Err(format!("empty variable name in `{s}`"));
     }
+    crate::book::validate_env_name(key).map_err(|e| e.to_string())?;
     Ok((key.to_string(), val.to_string()))
 }
 

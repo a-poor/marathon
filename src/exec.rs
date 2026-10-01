@@ -109,30 +109,29 @@ async fn run_book(book: &mut Runbook, yes: bool, active: &mut Option<RunningCell
 
     for idx in 0..book.blocks.len() {
         let env = book.env_for(idx);
+        let input_env = if matches!(book.blocks[idx], BookBlock::Input(_)) {
+            book.input_env_for(idx)
+        } else {
+            Default::default()
+        };
         if let BookBlock::Input(cell) = &mut book.blocks[idx] {
-            // Match command environment precedence, including inherited variables.
-            let mut input_env: std::collections::HashMap<_, _> = std::env::vars_os()
-                .filter_map(|(key, value)| {
-                    Some((key.into_string().ok()?, value.into_string().ok()?))
-                })
-                .collect();
-            input_env.extend(env);
             cell.try_refresh_options(&input_env)?;
             if let Some(value) = input_env.get(cell.target()) {
                 cell.answer(value.clone())?;
                 eprintln!("› input '{}' — using supplied value", cell.target());
             } else if yes {
-                let value = cell.config.default_value().with_context(|| {
-                    format!(
-                        "input '{}' needs a value; pass -e {}=VALUE or set its default",
-                        cell.target(),
+                let value = cell.validated_default()?.ok_or_else(|| {
+                    cell.input_error(format!(
+                        "needs a value; pass -e {}=VALUE or set its default",
                         cell.target()
-                    )
+                    ))
                 })?;
                 cell.answer(value)?;
                 eprintln!("› input '{}' — using default", cell.target());
             } else {
-                prompt_input(cell, &mut answers).await?;
+                prompt_input(cell, &mut answers)
+                    .await
+                    .map_err(|e| cell.input_error(e))?;
             }
             continue;
         }
@@ -208,9 +207,6 @@ async fn run_book(book: &mut Runbook, yes: bool, active: &mut Option<RunningCell
 }
 
 async fn prompt_input(cell: &mut InputCell, answers: &mut Answers) -> Result<()> {
-    if matches!(cell.config, MagicInputBlock::Select { .. }) && cell.options().is_empty() {
-        bail!("input '{}': no options available", cell.target());
-    }
     eprintln!(
         "\n{} → ${}",
         crate::ansi::sanitize(cell.prompt()),
@@ -221,7 +217,13 @@ async fn prompt_input(cell: &mut InputCell, answers: &mut Answers) -> Result<()>
             eprintln!("  {}. {}", i + 1, crate::ansi::sanitize(option));
         }
     }
-    let default = cell.config.default_value();
+    let default = match cell.validated_default() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}; enter an answer instead.");
+            None
+        }
+    };
     let hint = match &cell.config {
         MagicInputBlock::Confirm { .. } => "yes/no",
         MagicInputBlock::Select { .. } => "option number",
@@ -234,6 +236,19 @@ async fn prompt_input(cell: &mut InputCell, answers: &mut Answers) -> Result<()>
     };
     loop {
         let answer = answers.read(&prompt).await?;
+        if answer.is_empty()
+            && default.is_none()
+            && matches!(cell.config, MagicInputBlock::Select { .. })
+        {
+            eprintln!(
+                "{}",
+                cell.input_error(format!(
+                    "Enter an option number from 1 to {}.",
+                    cell.options().len()
+                ))
+            );
+            continue;
+        }
         let value = if answer.is_empty() {
             default.clone().unwrap_or_else(|| {
                 if matches!(cell.config, MagicInputBlock::Confirm { .. }) {
@@ -252,7 +267,13 @@ async fn prompt_input(cell: &mut InputCell, answers: &mut Answers) -> Result<()>
             {
                 Some(value) => value.clone(),
                 None => {
-                    eprintln!("Enter an option number from 1 to {}.", cell.options().len());
+                    eprintln!(
+                        "{}",
+                        cell.input_error(format!(
+                            "Enter an option number from 1 to {}.",
+                            cell.options().len()
+                        ))
+                    );
                     continue;
                 }
             }

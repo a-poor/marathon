@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::util::{get_frontmatter_node, parse_markdown};
@@ -48,13 +48,26 @@ impl Runbook {
         let ast = parse_markdown(doc)?;
 
         // Parse the frontmatter
-        let frontmatter = match get_frontmatter_node(&ast) {
-            Some(txt) if !txt.trim().is_empty() => serde_yaml::from_str(&txt)?,
+        let frontmatter: BookFrontmatter = match get_frontmatter_node(&ast) {
+            Some(txt) if !txt.trim().is_empty() => serde_yaml::from_str(&txt).map_err(|err| {
+                let (line, column) = err
+                    .location()
+                    .map(|l| (l.line() + 1, l.column()))
+                    .unwrap_or((1, 1));
+                anyhow!(
+                    "{}:{line}:{column}: frontmatter: {err}",
+                    source_name(path.as_deref())
+                )
+            })?,
             _ => BookFrontmatter::default(),
         };
+        frontmatter
+            .validate()
+            .with_context(|| format!("{}:1:1: frontmatter", source_name(path.as_deref())))?;
 
         // Coerce the blocks. Frontmatter (YAML/TOML) is config, not content, so
         // it isn't a navigable/rendered block.
+        let mut cell_number = 0;
         let blocks = ast
             .children
             .iter()
@@ -66,15 +79,31 @@ impl Runbook {
             })
             .map(|n| match n {
                 markdown::mdast::Node::Code(c) => {
+                    cell_number += 1;
+                    let (line, column) = c
+                        .position
+                        .as_ref()
+                        .map(|p| (p.start.line, p.start.column))
+                        .unwrap_or((1, 1));
+                    let location = format!(
+                        "{}:{line}:{column}: cell {cell_number}",
+                        source_name(path.as_deref())
+                    );
                     // Parse the code block
-                    let b = CodeBlock::try_from(c.clone()).map_err(|err| anyhow!("{}", err))?;
+                    let b = CodeBlock::try_from(c.clone())
+                        .map_err(|err| anyhow!("{location}: {err}"))?;
 
                     // Is it an input block?
                     if b.lang == "json"
                         && b.meta.mrthn.as_ref().map(|s| s == "input").unwrap_or(false)
                     {
-                        let mib: MagicInputBlock = serde_json::from_str(&b.content)?;
-                        return Ok(BookBlock::Input(InputCell::new(mib)));
+                        let mib: MagicInputBlock = serde_json::from_str(&b.content)
+                            .with_context(|| format!("{location}: input JSON"))?;
+                        mib.validate()
+                            .with_context(|| format!("{location}: input '{}'", mib.target()))?;
+                        let mut cell = InputCell::new(mib);
+                        cell.location = Some(location);
+                        return Ok(BookBlock::Input(cell));
                     }
 
                     // Otherwise just runnable code
@@ -106,21 +135,23 @@ impl Runbook {
     }
 
     /// Begin editing the input cell at `idx`, if that block is one. Builds the
-    /// cell's environment ([`env_for`]) first so a select cell's `option_file`
+    /// scratch directory and full environment first so a select cell's `option_file`
     /// path can reference `TMP_DIR` or an earlier answer.
-    ///
-    /// [`env_for`]: Runbook::env_for
-    pub fn begin_edit_at(&mut self, idx: usize) {
-        // `env_for` returns an owned map, so its immutable borrow of `self` ends
-        // before we take the mutable block borrow below.
-        let env = self.env_for(idx);
+    pub fn begin_edit_at(&mut self, idx: usize) -> Result<()> {
+        if !matches!(self.blocks.get(idx), Some(BookBlock::Input(_))) {
+            return Ok(());
+        }
+        self.ensure_tmp_dir()
+            .context("creating temp dir for input")?;
+        let env = self.input_env_for(idx);
         if let Some(BookBlock::Input(cell)) = self.blocks.get_mut(idx) {
             cell.begin_edit(&env);
         }
+        Ok(())
     }
 
     /// The active temp directory as an env-var `(name, path)` pair, if one has been
-    /// created yet. The dir is made lazily on first run, so this is `None` until then.
+    /// created yet. Made lazily on first run or input edit, so `None` until then.
     /// Used by the header to surface the path for the user.
     pub fn tmp_dir_env(&self) -> Option<(String, String)> {
         self.tmp_dir
@@ -247,6 +278,16 @@ impl Runbook {
         map
     }
 
+    /// The full environment for input values and option-file expansion, including
+    /// inherited variables with the same precedence used by command execution.
+    pub fn input_env_for(&self, idx: usize) -> HashMap<String, String> {
+        let mut env: HashMap<_, _> = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
+        env.extend(self.env_for(idx));
+        env
+    }
+
     /// The base environment shown in the header: frontmatter `env` overlaid with CLI
     /// `--env`, sorted by key. Per-cell additions — `TMP_DIR`, answered inputs — are
     /// layered on only at run time by [`env_for`], so they're deliberately excluded.
@@ -343,6 +384,31 @@ impl Runbook {
             self.tmp_dir = None; // Next ensure_tmp_dir creates a fresh one.
         }
     }
+}
+
+fn source_name(path: Option<&Path>) -> String {
+    path.map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<runbook>".into())
+}
+
+/// Names exported by runbooks must be usable as shell variables.
+pub(crate) fn validate_env_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    if !chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        bail!("invalid environment target {name:?}; use [A-Za-z_][A-Za-z0-9_]*");
+    }
+    Ok(())
+}
+
+fn validate_env_value(value: &str) -> Result<()> {
+    if value.contains('\0') {
+        bail!("environment values cannot contain NUL characters");
+    }
+    Ok(())
 }
 
 /// Aggregate run state across all code cells, derived fresh each draw from the
@@ -528,6 +594,21 @@ pub struct BookFrontmatter {
     pub tmp_dir: Option<TmpDirConf>,
 }
 
+impl BookFrontmatter {
+    fn validate(&self) -> Result<()> {
+        if let Some(env) = &self.env {
+            for (key, value) in env {
+                validate_env_name(key).with_context(|| format!("env key {key:?}"))?;
+                validate_env_value(value).with_context(|| format!("env.{key}"))?;
+            }
+        }
+        if let Some(name) = self.tmp_dir.as_ref().and_then(|c| c.var_name.as_deref()) {
+            validate_env_name(name).context("tmp_dir.var_name")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct InterpreterConf {
     /// Path to the interpreter
@@ -650,6 +731,42 @@ pub enum MagicInputBlock {
 }
 
 impl MagicInputBlock {
+    /// Static checks only: never open an option file while parsing a runbook.
+    fn validate(&self) -> Result<()> {
+        validate_env_name(self.target())?;
+        if let Some(default) = self.default_value() {
+            validate_env_value(&default).context("invalid default")?;
+        }
+        if let Self::Select {
+            options,
+            option_file,
+            default,
+            ..
+        } = self
+        {
+            let options = options.as_deref().unwrap_or_default();
+            for value in options {
+                validate_env_value(value).context("invalid option")?;
+            }
+            if let Some(path) = option_file {
+                if path.is_empty() || path.contains('\0') {
+                    bail!("option_file must be a nonempty path without NUL characters");
+                }
+            } else {
+                if options.is_empty() {
+                    bail!("no options available; provide nonempty options or an option_file");
+                }
+                if default
+                    .as_ref()
+                    .is_some_and(|value| !options.contains(value))
+                {
+                    bail!("invalid default: value is not one of the available options");
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn default_value(&self) -> Option<String> {
         match self {
             Self::Confirm { default, .. } => default.map(|v| if v { "yes" } else { "no" }.into()),
@@ -696,9 +813,14 @@ pub struct InputCell {
     pub state: InputState,
     /// Resolved select options: the inline `options` list followed by any lines
     /// read from `option_file`. Recomputed on `begin_edit` (and seeded at
-    /// construction) so a file produced by a preceding cell at runtime is picked
-    /// up. Always empty for non-select cells.
+    /// construction with inline choices only) so a file produced by a preceding
+    /// cell at runtime is picked up. Always empty for non-select cells.
     loaded_options: Vec<String>,
+    /// A failed/incomplete refresh blocks submission until editing is reopened.
+    options_error: Option<String>,
+    /// Last error shown inline; invalid drafts stay editable.
+    error: Option<String>,
+    location: Option<String>,
 }
 
 /// Where an input cell is in its lifecycle.
@@ -722,7 +844,7 @@ pub enum Draft {
     /// Free text with a cursor.
     Text(TextDraft),
     /// Highlighted option index into the cell's options.
-    Select(usize),
+    Select(Option<usize>),
 }
 
 /// A single-line text buffer with a char-indexed cursor.
@@ -865,16 +987,27 @@ fn expand_env(input: &str, env: &HashMap<String, String>) -> String {
 
 impl InputCell {
     pub fn new(config: MagicInputBlock) -> Self {
-        let mut cell = Self {
+        let (loaded_options, options_error) = match &config {
+            MagicInputBlock::Select {
+                options,
+                option_file,
+                ..
+            } => (
+                options.clone().unwrap_or_default(),
+                option_file
+                    .as_ref()
+                    .map(|_| "options have not been loaded; reopen this input to load them".into()),
+            ),
+            _ => (Vec::new(), None),
+        };
+        Self {
             config,
             state: InputState::Pending,
-            loaded_options: Vec::new(),
-        };
-        // Seed inline options (and any already-present, non-templated file).
-        // Variable-bearing `option_file` paths resolve later, on `begin_edit`,
-        // once an env (and `TMP_DIR`) exists.
-        cell.refresh_options(&HashMap::new());
-        cell
+            loaded_options,
+            options_error,
+            error: None,
+            location: None,
+        }
     }
 
     pub fn prompt(&self) -> &str {
@@ -899,15 +1032,19 @@ impl InputCell {
     /// against `env` (see [`expand_env`]), so it can reference `TMP_DIR` or an
     /// earlier answer. Read lazily so a file produced by a preceding cell at
     /// runtime is picked up; blank lines are skipped and surrounding whitespace
-    /// trimmed. Best-effort — an unreadable `option_file` leaves just the inline
-    /// options. No-op for non-select cells.
-    pub fn refresh_options(&mut self, env: &HashMap<String, String>) {
-        let _ = self.try_refresh_options(env);
+    /// trimmed. A failed read discards all cached choices and blocks submission.
+    pub fn try_refresh_options(&mut self, env: &HashMap<String, String>) -> Result<()> {
+        self.loaded_options.clear();
+        let result = self.load_options(env);
+        self.options_error = result.as_ref().err().map(|e| format!("{e:#}"));
+        self.error = self
+            .options_error
+            .as_ref()
+            .map(|e| self.input_error(e).to_string());
+        result.map_err(|e| self.input_error(format!("{e:#}")))
     }
 
-    /// Strict variant for CLI execution: report unreadable option files instead
-    /// of silently answering an empty selection.
-    pub fn try_refresh_options(&mut self, env: &HashMap<String, String>) -> Result<()> {
+    fn load_options(&mut self, env: &HashMap<String, String>) -> Result<()> {
         let MagicInputBlock::Select {
             options,
             option_file,
@@ -916,43 +1053,86 @@ impl InputCell {
         else {
             return Ok(());
         };
-        self.loaded_options = options.clone().unwrap_or_default();
+        let mut loaded = options.clone().unwrap_or_default();
         if let Some(raw) = option_file {
             let path = expand_env(raw, env);
             let text = std::fs::read_to_string(&path)
-                .map_err(|e| anyhow!("reading option file {path}: {e}"))?;
-            self.loaded_options.extend(
+                .map_err(|e| anyhow!("reading option file {path:?}: {e}; fix the file or run its generating cell, then reopen this input"))?;
+            loaded.extend(
                 text.lines()
                     .map(str::trim)
                     .filter(|l| !l.is_empty())
                     .map(str::to_owned),
             );
         }
+        if loaded.is_empty() {
+            bail!(
+                "no options available; add choices to options or option_file, then reopen this input"
+            );
+        }
+        for value in &loaded {
+            validate_env_value(value).context("invalid option")?;
+        }
+        self.loaded_options = loaded;
         Ok(())
     }
 
-    /// Validate and record a CLI-supplied answer using the same state as the TUI.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub(crate) fn input_error(&self, message: impl std::fmt::Display) -> anyhow::Error {
+        let location = self
+            .location
+            .as_ref()
+            .map(|l| format!("{l}: "))
+            .unwrap_or_default();
+        anyhow!("{location}input '{}': {message}", self.target())
+    }
+
+    /// Shared validation boundary for CLI answers and TUI drafts. A failed
+    /// answer never replaces the current state.
     pub fn answer(&mut self, value: String) -> Result<()> {
-        let value = match &self.config {
-            MagicInputBlock::Confirm { .. } => match value.trim().to_ascii_lowercase().as_str() {
-                "y" | "yes" | "true" => "yes".to_owned(),
-                "n" | "no" | "false" => "no".to_owned(),
-                _ => anyhow::bail!("{}: expected yes or no", self.target()),
-            },
-            MagicInputBlock::Select { .. } if !self.options().contains(&value) => {
-                anyhow::bail!(
-                    "{}: value is not one of the available options",
-                    self.target()
-                );
-            }
-            _ => value,
-        };
+        let result = self
+            .validate_answer(value)
+            .map_err(|e| self.input_error(format!("{e:#}")));
+        self.error = result.as_ref().err().map(ToString::to_string);
+        let value = result?;
         self.state = InputState::Answered { value };
         Ok(())
     }
 
-    fn option_at(&self, idx: usize) -> Option<&str> {
-        self.options().get(idx).map(String::as_str)
+    fn validate_answer(&self, value: String) -> Result<String> {
+        validate_env_name(self.target())?;
+        validate_env_value(&value)?;
+        if let Some(error) = &self.options_error {
+            bail!("{error}");
+        }
+        let value = match &self.config {
+            MagicInputBlock::Confirm { .. } => match value.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" | "true" => "yes".to_owned(),
+                "n" | "no" | "false" => "no".to_owned(),
+                _ => bail!("expected yes or no"),
+            },
+            MagicInputBlock::Select { .. } if self.options().is_empty() => {
+                bail!("no options available; add choices and reopen this input");
+            }
+            MagicInputBlock::Select { .. } if !self.options().contains(&value) => {
+                bail!("value is not one of the available options; choose an available option");
+            }
+            _ => value,
+        };
+        Ok(value)
+    }
+
+    pub(crate) fn validated_default(&self) -> Result<Option<String>> {
+        self.config
+            .default_value()
+            .map(|value| {
+                self.validate_answer(value)
+                    .map_err(|e| self.input_error(format!("invalid default: {e:#}")))
+            })
+            .transpose()
     }
 
     /// True if the cell is currently focused for editing.
@@ -970,26 +1150,43 @@ impl InputCell {
     }
 
     /// Begin editing, seeding a draft from any prior answer or sensible default.
-    /// `env` is the cell's environment (from [`Runbook::env_for`]), used to
+    /// `env` is the cell's environment (from [`Runbook::input_env_for`]), used to
     /// expand a select cell's `option_file` path.
     pub fn begin_edit(&mut self, env: &HashMap<String, String>) {
         // Re-read `option_file` in case a preceding cell just produced it.
-        self.refresh_options(env);
+        // Refresh errors are retained on the cell for display and submission.
+        let _ = self.try_refresh_options(env);
         let prior = match &self.state {
             InputState::Answered { value } => Some(value.clone()),
             _ => None,
         };
         let seed = prior.clone().or_else(|| self.config.default_value());
+        if self.error.is_none()
+            && let Some(value) = &seed
+            && let Err(error) = self.validate_answer(value.clone())
+        {
+            let label = if prior.is_some() {
+                "previous answer"
+            } else {
+                "default"
+            };
+            self.error = Some(
+                self.input_error(format!(
+                    "invalid {label}: {error:#}; edit the answer before submitting"
+                ))
+                .to_string(),
+            );
+        }
         let draft = match &self.config {
             MagicInputBlock::Confirm { .. } => Draft::Confirm(seed.as_deref() == Some("yes")),
             MagicInputBlock::Input { .. } => {
                 Draft::Text(TextDraft::seeded(seed.clone().unwrap_or_default()))
             }
             MagicInputBlock::Select { .. } => {
-                let idx = seed
-                    .as_deref()
-                    .and_then(|v| self.options().iter().position(|o| o == v))
-                    .unwrap_or(0);
+                let idx = match seed.as_deref() {
+                    Some(value) => self.options().iter().position(|o| o == value),
+                    None => (!self.options().is_empty()).then_some(0),
+                };
                 Draft::Select(idx)
             }
         };
@@ -997,34 +1194,52 @@ impl InputCell {
     }
 
     /// Commit the current draft as the answer. No-op if not editing.
-    pub fn submit(&mut self) {
+    pub fn submit(&mut self) -> Result<()> {
         let value = match &self.state {
             InputState::Editing { draft, .. } => match draft {
                 Draft::Confirm(b) => Some(if *b { "yes" } else { "no" }.to_string()),
                 Draft::Text(t) => Some(t.value.clone()),
-                Draft::Select(i) => Some(self.option_at(*i).unwrap_or_default().to_string()),
+                Draft::Select(i) => match i.and_then(|idx| self.options().get(idx)).cloned() {
+                    Some(value) => Some(value),
+                    None => {
+                        let message =
+                            self.options_error
+                                .as_deref()
+                                .unwrap_or(if self.options().is_empty() {
+                                    "no options available; add choices and reopen this input"
+                                } else {
+                                    "no option selected; use Up/Down to choose an available option"
+                                });
+                        let error = self.input_error(message);
+                        self.error = Some(error.to_string());
+                        return Err(error);
+                    }
+                },
             },
             _ => None,
         };
         if let Some(value) = value {
-            self.state = InputState::Answered { value };
+            self.answer(value)?;
         }
+        Ok(())
     }
 
     /// Discard any answer (or in-progress edit) and return to pending.
     pub fn clear(&mut self) {
         self.state = InputState::Pending;
+        self.error = None;
     }
 
-    /// Cancel editing, restoring a prior answer if there was one.
+    /// Cancel editing, restoring a prior answer if still valid after the refresh.
     pub fn cancel(&mut self) {
         if let InputState::Editing { prior, .. } = &self.state {
-            self.state = match prior {
-                Some(value) => InputState::Answered {
-                    value: value.clone(),
-                },
-                None => InputState::Pending,
-            };
+            let prior = prior.clone();
+            self.state = InputState::Pending;
+            self.error = None;
+            if let Some(value) = prior {
+                // Changed options must not resurrect an answer that is no longer valid.
+                let _ = self.answer(value);
+            }
         }
     }
 
@@ -1057,11 +1272,12 @@ impl InputCell {
             return;
         }
         if let Some(Draft::Select(i)) = self.draft_mut() {
-            *i = if forward {
-                (*i + 1).min(n - 1)
-            } else {
-                i.saturating_sub(1)
-            };
+            *i = Some(match *i {
+                Some(idx) if forward => idx.saturating_add(1).min(n - 1),
+                Some(idx) => idx.saturating_sub(1).min(n - 1),
+                None => 0,
+            });
+            self.error = None;
         }
     }
 
@@ -1147,6 +1363,146 @@ mod tests {
         })
     }
 
+    fn file_select(path: &Path) -> InputCell {
+        InputCell::new(MagicInputBlock::Select {
+            prompt: "Pick".into(),
+            target: "CHOICE".into(),
+            default: Some("inline".into()),
+            options: Some(vec!["inline".into()]),
+            option_file: Some(path.display().to_string()),
+        })
+    }
+
+    #[test]
+    fn failed_option_reads_block_cli_and_tui_even_with_inline_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid_utf8 = dir.path().join("invalid-utf8");
+        std::fs::write(&invalid_utf8, [0xff]).unwrap();
+        for path in [
+            dir.path().join("missing"),
+            dir.path().to_owned(),
+            invalid_utf8,
+        ] {
+            let mut cell = file_select(&path);
+            assert!(
+                cell.answer("inline".into()).is_err(),
+                "file must be loaded first"
+            );
+            let cli_error = cell
+                .try_refresh_options(&HashMap::new())
+                .unwrap_err()
+                .to_string();
+            assert!(cli_error.contains("reading option file"));
+            assert!(cli_error.contains(&path.display().to_string()));
+            assert!(cell.answer("inline".into()).is_err());
+            cell.begin_edit(&HashMap::new());
+            assert_eq!(cell.error(), Some(cli_error.as_str()));
+            assert!(cell.submit().is_err());
+            assert!(cell.is_editing());
+            assert!(cell.resolved().is_none());
+            assert!(cell.options().is_empty());
+        }
+    }
+
+    #[test]
+    fn changed_option_files_do_not_reuse_stale_choices_or_prior_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("options");
+        std::fs::write(&path, "old\n").unwrap();
+        let mut cell = file_select(&path);
+        cell.try_refresh_options(&HashMap::new()).unwrap();
+        cell.answer("old".into()).unwrap();
+
+        std::fs::write(&path, "new\n").unwrap();
+        cell.begin_edit(&HashMap::new());
+        assert!(cell.error().unwrap().contains("previous answer"));
+        assert!(cell.submit().is_err());
+        cell.cancel();
+        assert!(cell.resolved().is_none());
+        cell.begin_edit(&HashMap::new());
+        cell.select_move(true);
+        cell.submit().unwrap();
+        assert_eq!(cell.resolved(), Some(("CHOICE", "new")));
+        assert!(cell.error().is_none());
+    }
+
+    #[test]
+    fn empty_choices_and_out_of_range_drafts_cannot_be_submitted() {
+        let mut cell = select();
+        cell.begin_edit(&HashMap::new());
+        if let InputState::Editing { draft, .. } = &mut cell.state {
+            *draft = Draft::Select(Some(99));
+        }
+        assert!(cell.submit().is_err());
+        assert!(cell.is_editing());
+        assert!(cell.resolved().is_none());
+        cell.select_move(true);
+        cell.submit().unwrap();
+        assert_eq!(cell.resolved(), Some(("CHOICE", "c")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty");
+        std::fs::write(&path, " \n\t\n").unwrap();
+        let mut cell = file_select(&path);
+        if let MagicInputBlock::Select { options, .. } = &mut cell.config {
+            *options = None;
+        }
+        cell.begin_edit(&HashMap::new());
+        assert!(cell.error().unwrap().contains("no options available"));
+        assert!(cell.answer(String::new()).is_err());
+        assert!(cell.submit().is_err());
+        assert!(cell.resolved().is_none());
+    }
+
+    #[test]
+    fn cli_and_tui_reject_nul_values_and_allow_empty_text() {
+        let mut cli = text();
+        let mut tui = text();
+        tui.begin_edit(&HashMap::new());
+        tui.insert_char('\0');
+        let error = cli.answer("\0".into()).unwrap_err().to_string();
+        assert_eq!(tui.submit().unwrap_err().to_string(), error);
+        assert!(tui.is_editing());
+        assert!(tui.resolved().is_none());
+        tui.backspace();
+        tui.submit().unwrap();
+        cli.answer(String::new()).unwrap();
+        assert_eq!(tui.resolved(), cli.resolved());
+        assert!(tui.error().is_none());
+    }
+
+    #[test]
+    fn input_edit_initializes_scratch_and_uses_layered_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("choices"), "from-file\n").unwrap();
+        let mut book = Runbook::new(
+            None::<&str>,
+            r#"---
+env:
+  OPTIONS_NAME: overridden
+---
+```json mrthn=input
+{"type":"select","prompt":"Pick","target":"CHOICE","option_file":"${SCRATCH}/$OPTIONS_NAME"}
+```"#,
+        )
+        .unwrap();
+        book.frontmatter.tmp_dir = Some(TmpDirConf {
+            path: Some(dir.path().to_owned()),
+            var_name: Some("SCRATCH".into()),
+            skip_cleanup: None,
+        });
+        book.cli_env.insert("OPTIONS_NAME".into(), "choices".into());
+        assert!(book.tmp_dir.is_none());
+        book.begin_edit_at(0).unwrap();
+        let cell = book.input_at_mut(0).unwrap();
+        assert_eq!(cell.options(), ["from-file"]);
+        cell.submit().unwrap();
+        assert_eq!(
+            book.env_for(1).get("CHOICE").map(String::as_str),
+            Some("from-file")
+        );
+    }
+
     #[test]
     fn split_utf8_output_is_decoded_only_at_the_text_boundary() {
         let mut book = Runbook::new(None::<&str>, "```sh\necho test\n```").unwrap();
@@ -1171,7 +1527,7 @@ mod tests {
             cell.cancel();
             assert!(cell.resolved().is_none());
             cell.begin_edit(&HashMap::new());
-            cell.submit();
+            cell.submit().unwrap();
             assert_eq!(cell.resolved().unwrap().1, expected);
         }
     }
@@ -1194,13 +1550,12 @@ mod tests {
             options: None,
             option_file: Some(path.display().to_string()),
         });
-        // Trimmed, blank lines skipped.
-        assert_eq!(cell.options(), ["alpha", "beta", "gamma"]);
-
         // Picking the second option resolves to its value.
         cell.begin_edit(&HashMap::new());
+        // Trimmed, blank lines skipped; files are only read on activation.
+        assert_eq!(cell.options(), ["alpha", "beta", "gamma"]);
         cell.select_move(true);
-        cell.submit();
+        cell.submit().unwrap();
         assert_eq!(cell.resolved(), Some(("CHOICE", "beta")));
     }
 
@@ -1210,13 +1565,15 @@ mod tests {
         let path = dir.path().join("choices.txt");
         std::fs::write(&path, "from_file\n").unwrap();
 
-        let cell = InputCell::new(MagicInputBlock::Select {
+        let mut cell = InputCell::new(MagicInputBlock::Select {
             prompt: "Pick".into(),
             target: "CHOICE".into(),
             default: None,
             options: Some(vec!["inline".into()]),
             option_file: Some(path.display().to_string()),
         });
+        assert_eq!(cell.options(), ["inline"]);
+        cell.begin_edit(&HashMap::new());
         assert_eq!(cell.options(), ["inline", "from_file"]);
     }
 
@@ -1225,8 +1582,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("choices.txt");
 
-        // File does not exist yet at construction (e.g. a preceding cell will
-        // create it). Best-effort read leaves the cell with no options.
+        // Files are not read at construction (a preceding cell may create it).
         let mut cell = InputCell::new(MagicInputBlock::Select {
             prompt: "Pick".into(),
             target: "CHOICE".into(),
@@ -1299,12 +1655,12 @@ mod tests {
         let mut c = confirm();
         c.begin_edit(&HashMap::new());
         // Default seed is No.
-        c.submit();
+        c.submit().unwrap();
         assert_eq!(c.resolved(), Some(("OK", "no")));
 
         c.begin_edit(&HashMap::new());
         c.set_confirm(true);
-        c.submit();
+        c.submit().unwrap();
         assert_eq!(c.resolved(), Some(("OK", "yes")));
     }
 
@@ -1313,7 +1669,7 @@ mod tests {
         let mut c = confirm();
         c.begin_edit(&HashMap::new());
         c.toggle_confirm();
-        c.submit();
+        c.submit().unwrap();
         assert_eq!(c.resolved(), Some(("OK", "yes")));
     }
 
@@ -1326,12 +1682,12 @@ mod tests {
         }
         c.cursor_left();
         c.insert_char('X'); // ab[X]c
-        c.submit();
+        c.submit().unwrap();
         assert_eq!(c.resolved(), Some(("NAME", "abXc")));
 
         c.begin_edit(&HashMap::new()); // re-edit seeds from prior answer, cursor at end
         c.backspace();
-        c.submit();
+        c.submit().unwrap();
         assert_eq!(c.resolved(), Some(("NAME", "abX")));
     }
 
@@ -1356,7 +1712,7 @@ mod tests {
         c.select_move(true); // -> 1
         c.select_move(true); // -> 2
         c.select_move(true); // clamps at 2
-        c.submit();
+        c.submit().unwrap();
         assert_eq!(c.resolved(), Some(("CHOICE", "c")));
     }
 
@@ -1365,7 +1721,7 @@ mod tests {
         let mut c = text();
         c.begin_edit(&HashMap::new());
         c.insert_char('z');
-        c.submit();
+        c.submit().unwrap();
         assert_eq!(c.resolved(), Some(("NAME", "z")));
 
         c.begin_edit(&HashMap::new());
@@ -1388,7 +1744,7 @@ mod tests {
         let mut c = select();
         c.begin_edit(&HashMap::new());
         c.select_move(true); // -> "b"
-        c.submit();
+        c.submit().unwrap();
         assert_eq!(c.resolved(), Some(("CHOICE", "b")));
 
         c.begin_edit(&HashMap::new()); // should seed index at "b" (1)
@@ -1396,7 +1752,7 @@ mod tests {
             InputState::Editing {
                 draft: Draft::Select(i),
                 ..
-            } => assert_eq!(*i, 1),
+            } => assert_eq!(*i, Some(1)),
             other => panic!("expected select draft, got {other:?}"),
         }
     }
@@ -1473,7 +1829,7 @@ mod tests {
         let cell = rb.input_at_mut(0).unwrap();
         cell.begin_edit(&HashMap::new());
         cell.insert_char('z');
-        cell.submit();
+        cell.submit().unwrap();
         if let BookBlock::Code(c) = &mut rb.blocks[1] {
             c.begin_run();
             c.push_output("out\n");
@@ -1513,7 +1869,7 @@ mod tests {
         let cell = rb.input_at_mut(2).unwrap();
         cell.begin_edit(&HashMap::new());
         cell.insert_char('z');
-        cell.submit();
+        cell.submit().unwrap();
         assert_eq!(rb.copy_text(2), None);
 
         // Out of range.
@@ -1579,7 +1935,7 @@ mod tests {
         let cell = rb.input_at_mut(0).unwrap();
         cell.begin_edit(&HashMap::new());
         cell.insert_char('z');
-        cell.submit();
+        cell.submit().unwrap();
 
         // Now block 1 sees the answer; block 0 (the input itself) does not see
         // its own forthcoming value (only *preceding* cells count).

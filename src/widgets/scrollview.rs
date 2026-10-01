@@ -655,6 +655,12 @@ fn input_lines(cell: &InputCell, width: usize) -> Vec<Line<'static>> {
         InputState::Pending => lines.extend(pending_body(cell)),
         InputState::Editing { draft, .. } => lines.extend(editing_body(cell, draft)),
     }
+    if let Some(error) = cell.error() {
+        lines.extend(wrap(
+            &[format!("  ! {}", crate::ansi::sanitize(error)).red()],
+            width,
+        ));
+    }
 
     lines
 }
@@ -704,7 +710,7 @@ fn confirm_line(yes: bool) -> Line<'static> {
 }
 
 /// The option list with a `▶` marker and bold on the highlighted row.
-fn select_lines(cell: &InputCell, idx: usize) -> Vec<Line<'static>> {
+fn select_lines(cell: &InputCell, idx: Option<usize>) -> Vec<Line<'static>> {
     let opts = cell.options();
     if opts.is_empty() {
         return vec![Line::from("  ◦ (no options)").dim()];
@@ -712,7 +718,7 @@ fn select_lines(cell: &InputCell, idx: usize) -> Vec<Line<'static>> {
     opts.iter()
         .enumerate()
         .map(|(i, opt)| {
-            if i == idx {
+            if Some(i) == idx {
                 Line::from(vec![
                     "  ▶ ".cyan(),
                     Span::styled(opt.clone(), Style::new().add_modifier(Modifier::BOLD)),
@@ -1122,6 +1128,32 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
     }
 
     #[test]
+    fn input_errors_render_and_wrap_inside_the_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cell = InputCell::new(MagicInputBlock::Select {
+            prompt: "Pick".into(),
+            target: "CHOICE".into(),
+            default: None,
+            options: Some(vec!["inline".into()]),
+            option_file: Some(dir.path().join("missing").display().to_string()),
+        });
+        cell.begin_edit(&std::collections::HashMap::new());
+        assert!(cell.submit().is_err());
+        let lines = input_lines(&cell, 32);
+        assert!(lines.iter().all(|line| line.width() <= 32));
+        let text = lines.iter().map(line_text).collect::<Vec<_>>().join(" ");
+        assert!(text.contains("reading option file"));
+        assert!(text.contains("reopen this input"));
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.fg == Some(Color::Red))
+        );
+        assert!(!text.contains('✔'));
+    }
+
+    #[test]
     fn confirm_editing_marks_chosen_option() {
         let mut c = confirm_cell();
         c.begin_edit(&std::collections::HashMap::new());
@@ -1305,7 +1337,7 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
         let mut c = confirm_cell();
         c.begin_edit(&std::collections::HashMap::new());
         c.set_confirm(true);
-        c.submit();
+        c.submit().unwrap();
         let lines = input_lines(&c, 80);
         assert!(
             lines.iter().any(|l| line_text(l).contains("yes")),

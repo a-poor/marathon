@@ -426,7 +426,10 @@ impl App {
             return;
         };
         if self.book.input_at_mut(idx).is_some() {
-            self.book.begin_edit_at(idx);
+            if let Err(error) = self.book.begin_edit_at(idx) {
+                self.flash = Some((format!("{error:#}"), std::time::Instant::now()));
+                return;
+            }
             self.mode = Mode::Active;
             self.revision += 1;
         }
@@ -559,9 +562,10 @@ impl App {
                 self.mode = Mode::Navigate;
             }
             KeyCode::Enter => {
-                cell.submit();
-                self.mode = Mode::Navigate;
-                self.select_next_cell(idx);
+                if cell.submit().is_ok() {
+                    self.mode = Mode::Navigate;
+                    self.select_next_cell(idx);
+                }
             }
             code => match &cell.config {
                 MagicInputBlock::Confirm { .. } => match code {
@@ -683,6 +687,74 @@ mod tests {
         assert_eq!(
             app.book.input_at_mut(0).unwrap().resolved(),
             Some(("OK", "no"))
+        );
+    }
+
+    #[test]
+    fn failed_input_stays_editable_and_reopening_retries_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("choices");
+        let config = serde_json::json!({
+            "type": "select", "prompt": "Pick", "target": "CHOICE",
+            "options": ["inline"], "default": "inline", "option_file": path,
+        });
+        let doc = format!("```json mrthn=input\n{config}\n```\n\n```sh\necho downstream\n```");
+        let mut app = App::new(Runbook::new(Some("book.md"), &doc).unwrap());
+        app.scroll.select_index(1, app.selectable_count());
+        press(&mut app, KeyCode::Enter);
+        let error = app.book.input_at_mut(0).unwrap().error().unwrap();
+        assert!(error.contains("book.md:1:1: cell 1"));
+        assert!(error.contains("reading option file"));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Active);
+        assert_eq!(app.selected_block(), Some(0));
+        assert!(!app.book.env_for(1).contains_key("CHOICE"));
+        assert!(app.runs.is_empty());
+
+        press(&mut app, KeyCode::Esc);
+        std::fs::write(path, "from-file\n").unwrap();
+        press(&mut app, KeyCode::Enter);
+        assert!(app.book.input_at_mut(0).unwrap().error().is_none());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Navigate);
+        assert_eq!(app.selected_block(), Some(1));
+        assert_eq!(
+            app.book.env_for(1).get("CHOICE").map(String::as_str),
+            Some("from-file")
+        );
+    }
+
+    #[test]
+    fn invalid_generated_default_requires_an_explicit_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("choices");
+        std::fs::write(&path, "available\n").unwrap();
+        let config = serde_json::json!({
+            "type": "select", "prompt": "Pick", "target": "CHOICE",
+            "default": "missing", "option_file": path,
+        });
+        let doc = format!("```json mrthn=input\n{config}\n```");
+        let mut app = App::new(Runbook::new(None::<&str>, &doc).unwrap());
+        app.scroll.select_index(1, app.selectable_count());
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            app.book
+                .input_at_mut(0)
+                .unwrap()
+                .error()
+                .unwrap()
+                .contains("invalid default")
+        );
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Active);
+        assert!(app.book.input_at_mut(0).unwrap().resolved().is_none());
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Navigate);
+        assert_eq!(
+            app.book.input_at_mut(0).unwrap().resolved(),
+            Some(("CHOICE", "available"))
         );
     }
 

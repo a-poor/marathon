@@ -26,12 +26,12 @@ async fn answered_input_feeds_a_shell_cell() {
     let mut rb = Runbook::new(None::<&str>, DOC).unwrap();
 
     // Answer the input cell (block 0): WHO = "world".
-    rb.begin_edit_at(0);
+    rb.begin_edit_at(0).unwrap();
     let cell = rb.input_at_mut(0).unwrap();
     for ch in "world".chars() {
         cell.insert_char(ch);
     }
-    cell.submit();
+    cell.submit().unwrap();
 
     // Assemble + run the shell cell (block 1), as the TUI would.
     rb.ensure_tmp_dir().unwrap();

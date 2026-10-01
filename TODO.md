@@ -4,26 +4,13 @@ Current behavior is documented in [README.md](README.md) and [DESIGN.md](DESIGN.
 
 ## Priority workstreams
 
-The next priorities, in order, are input correctness, output spooling, execution
-controls, and release checks. Each is a separate workstream; input, output, and
-execution work share parts of `book.rs` and `tui.rs`, so coordinate model/API changes
-when working in parallel. Keep runbooks ordinary Markdown and update the README,
-design, samples, and bundled authoring skill when behavior changes.
+The next priorities, in order, are output spooling, execution controls, and release
+checks. Each is a separate workstream; output and execution work share parts of
+`book.rs` and `tui.rs`, so coordinate model/API changes when working in parallel.
+Keep runbooks ordinary Markdown and update the README, design, samples, and
+bundled authoring skill when behavior changes.
 
-### 1. Input correctness and validation
-
-- Surface unreadable `option_file` errors in the TUI instead of silently retaining
-  inline choices; prevent submitting a selection when no options are available.
-- Align CLI and TUI answer validation so invalid selections/defaults cannot become
-  answered inputs. Keep an invalid TUI input editable and show an actionable error.
-- Improve validation diagnostics with cell/source locations and checks for invalid
-  environment targets and input defaults. Preserve compatibility with unrelated
-  Markdown frontmatter fields, and defer checks that require generated option files
-  until the input is reached.
-- Add regression coverage for missing/unreadable option files, empty choices,
-  invalid defaults/targets, and consistent CLI/TUI validation.
-
-### 2. Output spooling and bounded memory
+### 1. Output spooling and bounded memory
 
 - Bound in-memory TUI output and spool full output to disk. Queued runner chunks
   are bounded today, but accumulated cell output grows without a limit; the
@@ -34,7 +21,7 @@ design, samples, and bundled authoring skill when behavior changes.
 - Keep CLI output byte-preserving and streaming. Verify large-output behavior,
   partial lines, split UTF-8, cancellation, and spool cleanup with local tests.
 
-### 3. Execution controls and recovery
+### 2. Execution controls and recovery
 
 - Add CLI cell/range selection and a way to start at a chosen cell, so recovering
   from a late failure does not require replaying every earlier command. Define
@@ -51,7 +38,7 @@ design, samples, and bundled authoring skill when behavior changes.
 - Cover partial-run input resolution, sequential execution, failure/cancellation,
   and existing active-run/reset/cleanup invariants with regression tests.
 
-### 4. Release checks
+### 3. Release checks
 
 - Add platform build/release smoke checks around the existing GoReleaser
   configuration.
@@ -101,6 +88,10 @@ design, samples, and bundled authoring skill when behavior changes.
 - GitHub Actions CI for formatting on stable Rust, plus Clippy, all-target tests
   (including CLI execution and process cleanup), and Rust 1.88.0 compatibility
   checks on Linux and macOS.
+- Shared CLI/TUI answer validation, strict option-file errors, editable TUI errors,
+  and source/cell diagnostics for invalid targets and defaults. File-dependent
+  checks are deferred until the input is reached; regression tests cover missing,
+  unreadable, empty, and changed options plus invalid defaults and targets.
 - CLI commands, shell completions, scaffolding, and bundled skill installation.
 - Text/confirm/select inputs, option files with environment expansion, explicit
   defaults, and input values passed to later cells.

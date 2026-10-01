@@ -311,6 +311,111 @@ fn missing_option_file_is_reported_before_downstream_execution() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("reading option file"));
 }
 
+#[test]
+fn option_file_failures_are_strict_with_supplied_or_inline_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let invalid_utf8 = dir.path().join("invalid-utf8");
+    std::fs::write(&invalid_utf8, [0xff]).unwrap();
+    for path in [
+        dir.path().join("missing"),
+        dir.path().to_owned(),
+        invalid_utf8,
+    ] {
+        let config = serde_json::json!({
+            "type": "select", "prompt": "Pick", "target": "MRTHN_TEST_REGION",
+            "options": ["inline"], "default": "inline", "option_file": path,
+        });
+        let doc = format!("```json mrthn=input\n{config}\n```\n```sh\necho wrong\n```");
+        for args in [
+            vec!["--yes"],
+            vec!["--yes", "-e", "MRTHN_TEST_REGION=inline"],
+            vec![],
+        ] {
+            let output = exec(&doc, &args, "");
+            assert!(!output.status.success(), "{output:?}");
+            assert!(output.stdout.is_empty());
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("book.md:1:1: cell 1"), "{error}");
+            assert!(error.contains("reading option file"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn empty_generated_options_and_invalid_defaults_fail_at_the_input() {
+    for (contents, expected) in [(" ", "no options available"), ("east", "invalid default")] {
+        let doc = format!(
+            r#"```sh
+printf '%s\n' '{contents}' > "$TMP_DIR/options"
+printf first
+```
+```json mrthn=input
+{{"type":"select","prompt":"Pick","target":"MRTHN_TEST_REGION","option_file":"$TMP_DIR/options","default":"west"}}
+```
+```sh
+printf downstream
+```"#
+        );
+        let output = exec(&doc, &["--yes"], "");
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"first");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("book.md:5:1: cell 2"), "{error}");
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn invalid_generated_default_can_be_corrected_interactively_or_overridden() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("options");
+    std::fs::write(&path, "east\n").unwrap();
+    let config = serde_json::json!({
+        "type": "select", "prompt": "Pick", "target": "MRTHN_TEST_REGION",
+        "option_file": path, "default": "west",
+    });
+    let doc = format!(
+        "```json mrthn=input\n{config}\n```\n```sh\nprintf '%s' \"$MRTHN_TEST_REGION\"\n```"
+    );
+    let output = exec(&doc, &[], "\n1\nyes\n");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"east");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid default"));
+    let output = exec(&doc, &["--yes", "-e", "MRTHN_TEST_REGION=east"], "");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"east");
+}
+
+#[test]
+fn invalid_static_inputs_and_cli_targets_fail_before_any_execution() {
+    for config in [
+        r#"{"type":"input","prompt":"Pick","target":"BAD-NAME"}"#,
+        r#"{"type":"select","prompt":"Pick","target":"CHOICE","options":["east"],"default":"west"}"#,
+    ] {
+        let doc = format!("```sh\nprintf wrong\n```\n```json mrthn=input\n{config}\n```");
+        let output = exec(&doc, &["--yes"], "");
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+    let output = exec(
+        "```sh\nprintf wrong\n```",
+        &["--yes", "-e", "BAD-NAME=value"],
+        "",
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid environment target"));
+}
+
+#[test]
+fn empty_option_requires_a_number_unless_it_is_an_explicit_default() {
+    let doc = "```json mrthn=input\n{\"type\":\"select\",\"prompt\":\"Pick\",\"target\":\"MRTHN_TEST_REGION\",\"options\":[\"\",\"east\"]}\n```\n```sh\nprintf '<%s>' \"$MRTHN_TEST_REGION\"\n```";
+    let output = exec(doc, &[], "\n1\nyes\n");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"<>");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Enter an option number"));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn ctrl_c_with_a_full_stdout_pipe_still_cleans_up() {
