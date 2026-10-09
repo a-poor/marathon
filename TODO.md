@@ -4,14 +4,14 @@ Current behavior is documented in [README.md](README.md) and [DESIGN.md](DESIGN.
 
 ## Priority workstreams
 
-The next priority is release checks. Keep runbooks ordinary Markdown and update
-the README, design, samples, and bundled authoring skill when behavior changes.
+Keep runbooks ordinary Markdown and update the README, design, samples, and
+bundled authoring skill when behavior changes.
 Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 
 ### 1. Release checks
 
-- Add platform build/release smoke checks around the existing GoReleaser
-  configuration.
+- Exercise Homebrew installation and the generated cask end to end. Archive smoke
+  checks cover the executable and completion commands, but not installation.
 
 ## Reliability and portability
 
@@ -29,9 +29,6 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
   scroll anchor. Selection/focus decoration should remain a draw-time overlay.
 - Preserve ANSI SGR colors as Ratatui styles while stripping other terminal escapes.
 - Optional stdout/stderr sinks and configurable stream separation.
-- Add PTY support and input forwarding for programs that require terminal
-  interaction (such as editors or password prompts). Today scripts consume stdin
-  and the runner cannot provide an interactive terminal.
 - Animate running-cell decoration without invalidating document layout every frame.
 
 ## Interaction and scope
@@ -43,6 +40,12 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 
 ## Deliberately deferred
 
+- PTY support and command input forwarding. Keep cell execution noninteractive for
+  now to preserve a simple, predictable runner. Runbooks should use input cells,
+  environment values, files, and commands' unattended flags. This does not remove
+  Marathon's own input prompts or TUI. Revisit only when concrete workflows justify
+  the added terminal ownership, input routing, and cancellation complexity; it is
+  not a planned requirement for the next release.
 - Persistent cross-session checkpoints. Current recovery reuses state only in an
   open TUI; partial CLI runs resolve inputs anew and never restore completion
   records. Persistence needs document fingerprints, changed-step invalidation,
@@ -62,6 +65,11 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 - GitHub Actions CI for formatting on stable Rust, plus Clippy, all-target tests
   (including CLI execution and process cleanup), and Rust 1.88.0 compatibility
   checks on Linux and macOS.
+- GoReleaser configuration validation and per-target snapshot archive smoke tests
+  for every configured release target. Linux/macOS exercise CLI execution, partial
+  selection, raw output, failure status, and scratch cleanup; Windows checks archive
+  contents, startup, completions, scaffolding, and validation only. Snapshots never
+  publish releases or update the Homebrew tap.
 - Shared CLI/TUI answer validation, strict option-file errors, editable TUI errors,
   and source/cell diagnostics for invalid targets and defaults. File-dependent
   checks are deferred until the input is reached; regression tests cover missing,

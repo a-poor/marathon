@@ -152,6 +152,12 @@ The CLI writes command bytes unchanged to stdout. All Marathon prompts, progress
 and errors go to stderr. CLI execution never creates output spools. The TUI
 requests `NO_COLOR=1` unless overridden; color rendering and PTYs are deferred.
 
+Noninteractive cell execution is a deliberate scope choice for now. Scripts own
+stdin; Marathon owns its input prompts and TUI. Prefer input cells, environment
+values, files, and unattended command flags to terminal input forwarding. Revisit
+PTYs only when concrete workflows justify the additional terminal ownership,
+input routing, and cancellation complexity.
+
 Each TUI run owns an `OutputCapture`: two private `NamedTempFile`s in the OS temp
 directory, one byte-exact raw capture and one incrementally cleaned UTF-8 capture.
 These are independent of scratch-directory settings, including `skip_cleanup` and
@@ -261,3 +267,13 @@ cancellation, and the actual CLI binary. Keep regression cases for byte fidelity
 partial output, duplicate starts, reset/quit, output backpressure, failed writes,
 signals, confirmation, input defaults/validation, exit codes, and scratch cleanup.
 Tests must use disposable directories and deterministic local commands.
+
+Release smoke CI derives its platform matrix from `.goreleaser.yaml`, validates
+that configuration, and builds a single-target snapshot with the release builder
+and archive settings on each native runner. It checks archive contents and
+checksums, then runs the extracted executable in a disposable directory. All
+targets cover startup, completions, scaffolding, and validation; Linux/macOS also
+cover execution, partial selection, byte fidelity, failure status, and scratch
+cleanup. Windows execution remains unsupported by these checks. Snapshot builds
+do not publish releases or update the Homebrew tap; installation through Homebrew
+and the interactive TUI still need separate verification.

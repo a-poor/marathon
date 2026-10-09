@@ -13,18 +13,32 @@ before:
     # if you don't do these things before calling goreleaser, it might be a
     # good idea to do them here:
     - rustup default stable
-    - cargo install --locked cargo-zigbuild
+    - cargo install --version 0.23.4 --locked cargo-zigbuild
     - cargo fetch --locked
 
 builds:
-  - builder: rust
+  - id: marathon
+    builder: rust
     flags:
       - --release
+      - --locked
     targets:
       - x86_64-unknown-linux-gnu
-      - x86_64-apple-darwin
       - x86_64-pc-windows-gnu
       - aarch64-unknown-linux-gnu
+  # Use Apple's linker for frameworks pulled in by the clipboard dependency.
+  # Zig-linked macOS binaries can abort at startup with duplicate linked dylibs:
+  # https://github.com/rust-cross/cargo-zigbuild/issues/457
+  # These targets must be built on macOS, including when making a full release.
+  - id: marathon-darwin
+    builder: rust
+    binary: marathon
+    command: build
+    flags:
+      - --release
+      - --locked
+    targets:
+      - x86_64-apple-darwin
       - aarch64-apple-darwin
 
 archives:

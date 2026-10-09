@@ -237,6 +237,8 @@ cleaning scratch files. Closing the output pipe also stops the active command.
 
 Commands receive their script over stdin, not the prompt input stream. Programs
 that require an interactive terminal are not supported by the current runner.
+This is a deliberate constraint for now: use input cells, environment values,
+files, and unattended command flags to keep execution predictable.
 
 ## TUI controls
 
@@ -350,6 +352,14 @@ started manually. It checks formatting on stable Rust and runs Clippy, the full
 test suite (including CLI execution and process cleanup), and the Rust 1.88.0
 minimum-version build check on both Linux and macOS.
 
+[Release smoke tests](.github/workflows/release-smoke.yml) validate the GoReleaser
+configuration and build snapshot archives for every configured release target.
+They verify checksums and archive contents, then test the extracted binaries:
+startup, completions, scaffolding, and validation on all targets; execution,
+partial selection, raw output, exit status, and scratch cleanup on Linux/macOS.
+Windows checks do not imply native shell execution support. These checks do not
+publish releases, update the Homebrew tap, or test Homebrew installation/the TUI.
+
 Run the same checks locally:
 
 ```sh
@@ -358,3 +368,23 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 cargo +1.88.0 check --all-targets --locked
 ```
+
+To smoke-test a native release archive locally, install GoReleaser v2.18.2 and use a
+Python virtual environment for the release tools. From the repository root:
+
+```sh
+python3 -m venv target/release-tools
+. target/release-tools/bin/activate
+python -m pip install -r scripts/release-smoke-requirements.txt
+goreleaser check
+python scripts/release-config.py aarch64-apple-darwin # use your native release target
+goreleaser release --snapshot --clean --skip=before --config target/release-smoke.yaml
+python scripts/release-smoke.py target/release-smoke
+```
+
+Run `python scripts/release-config.py` without a target to list the CI matrix.
+Generated configuration and archives live under `target/`. The global GoReleaser
+installation hooks are skipped because the toolchain is already provisioned.
+macOS artifacts use native `cargo build` and Apple's linker to avoid duplicate
+framework links in Zig-built binaries. Full releases therefore need a macOS build
+host; Linux/Windows targets continue to use `cargo zigbuild`.
