@@ -15,6 +15,11 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def xattr(*arguments):
+    return subprocess.run(["/usr/bin/xattr", *map(str, arguments)], check=True,
+                          capture_output=True, text=True, timeout=30).stdout.strip()
+
+
 def prepare(dist, destination):
     archives = list(dist.glob("*.tar.gz"))
     if len(archives) != 1:
@@ -91,15 +96,17 @@ def main():
         if "trust" in brew("commands", "--quiet", capture_output=True, text=True).stdout.split():
             brew("trust", "--cask", cask_name)
             trusted = True
-        brew("fetch", "--cask", "--quarantine", str(cask))
+        # Homebrew quarantines cask downloads by default. Current versions no
+        # longer accept the old --quarantine flag on fetch or install.
+        brew("fetch", "--cask", str(cask))
         cached = Path(brew("--cache", "--cask", str(cask), capture_output=True, text=True).stdout.strip())
         # A file:// snapshot must exercise the same quarantine path as a download.
-        quarantine = os.getxattr(cached, "com.apple.quarantine").decode("ascii")
+        quarantine = xattr("-p", "com.apple.quarantine", cached)
         if not quarantine or int(quarantine.split(";", 1)[0], 16) & 0x0040:
             raise RuntimeError("expected a quarantined download without prior user approval")
         attempted_install = True
-        brew("install", "--cask", "--quarantine", str(cask))
-        if "com.apple.quarantine" in os.listxattr(installed.resolve()):
+        brew("install", "--cask", str(cask))
+        if "com.apple.quarantine" in xattr(installed.resolve()).splitlines():
             raise RuntimeError("installed binary is still quarantined")
         with tempfile.TemporaryDirectory(prefix="marathon-installed-smoke-") as work:
             suite["smoke"](installed, Path(work))
