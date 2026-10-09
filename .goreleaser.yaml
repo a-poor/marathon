@@ -76,10 +76,10 @@ homebrew_casks:
         - bash
         - zsh
         - fish
-    # Binaries aren't notarized, so strip the Gatekeeper quarantine flag on
-    # install — otherwise macOS blocks the binary with a "cannot be opened" error.
+    # Binaries aren't notarized. Clear quarantine before Homebrew first runs the
+    # staged binary to generate completions; post-install hooks run too late.
     hooks:
-      post:
+      pre:
         install: |
           if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
             system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/marathon"]

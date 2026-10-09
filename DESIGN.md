@@ -290,7 +290,12 @@ cleanup. Windows execution remains unsupported by these checks. Snapshot builds
 do not publish releases or update the Homebrew tap. On disposable macOS runners,
 the generated cask's URL is redirected to the local snapshot archive; its checksum,
 DSL, hooks, and completion declarations remain intact. The test installs it into
-Homebrew, reruns executable checks, verifies installed completions, and uninstalls,
-checking that the binary, completions, and cask directory are removed. Existing
-installations are never replaced. The interactive TUI is covered by model/rendering
-tests and manual review of the VHS recording produced from `demo.tape`.
+Homebrew from a quarantined download, checks that the installed binary's quarantine
+attribute is cleared, reruns executable checks, verifies installed completions, and
+uninstalls, checking that the binary, completions, and cask directory are removed. Existing
+installations are never replaced. A separate check uses Homebrew's actual artifact
+ordering and the unchanged generated hooks on a disposable quarantined binary;
+quarantine must be cleared before reaching completion generation even if Gatekeeper
+is disabled on the runner. This check can also run locally without installing.
+The interactive TUI is covered by model/rendering tests and manual review of the
+VHS recording produced from `demo.tape`.

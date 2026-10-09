@@ -67,8 +67,10 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
   selection, raw output, failure status, and scratch cleanup; Windows checks archive
   contents, startup, completions, scaffolding, and validation only. Snapshots never
   publish releases or update the Homebrew tap.
-- macOS snapshot cask installation, installed CLI/completion checks, and uninstall
-  cleanup on disposable Homebrew runners.
+- macOS snapshot cask installation from quarantined downloads, quarantine removal
+  before completion generation, installed CLI/completion checks, and uninstall
+  cleanup on disposable Homebrew runners. Hook ordering also has a local check
+  that does not depend on Gatekeeper enforcement or replace installed files.
 - TUI `/` search with live highlights, match counts, `n`/`N` wraparound, and
   cancel/restore; README demo regenerated through `demo.tape`.
 - Shared CLI/TUI answer validation, strict option-file errors, editable TUI errors,

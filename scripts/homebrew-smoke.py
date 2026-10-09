@@ -8,6 +8,7 @@ import re
 import runpy
 import shutil
 import subprocess
+import sys
 import tempfile
 
 
@@ -34,18 +35,38 @@ def main():
     parser.add_argument("dist", type=Path)
     parser.add_argument("--prepare-only", type=Path, metavar="CASK",
                         help="write a local cask for inspection without installing")
+    parser.add_argument("--quarantine-only", action="store_true",
+                        help="test hook ordering with a disposable binary; do not install")
     args = parser.parse_args()
+    if args.prepare_only and args.quarantine_only:
+        parser.error("--prepare-only and --quarantine-only cannot be combined")
     if args.prepare_only:
         prepare(args.dist.resolve(), args.prepare_only)
         return
-    if os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
-        parser.error("installation is restricted to disposable GitHub-hosted runners; use --prepare-only locally")
+    if sys.platform != "darwin":
+        parser.error("Homebrew quarantine checks require macOS")
+    if not args.quarantine_only and os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
+        parser.error("installation is restricted to disposable GitHub-hosted runners; "
+                     "use --prepare-only or --quarantine-only locally")
 
     env = {**os.environ, "HOMEBREW_NO_AUTO_UPDATE": "1",
            "HOMEBREW_NO_INSTALL_CLEANUP": "1", "HOMEBREW_NO_ANALYTICS": "1"}
 
     def brew(*arguments, **kwargs):
-        return subprocess.run(["brew", *arguments], env=env, check=True, timeout=180, **kwargs)
+        # `brew ruby` otherwise persists developer mode in Homebrew's settings.
+        command_env = {**env, "HOMEBREW_DEV_CMD_RUN": "1"} if arguments[0] == "ruby" else env
+        return subprocess.run(["brew", *arguments], env=command_env, check=True, timeout=180, **kwargs)
+
+    # This regression check also runs locally without touching an installed cask.
+    suite = runpy.run_path(str(ROOT / "scripts/release-smoke.py"))
+    with tempfile.TemporaryDirectory(prefix="marathon-homebrew-smoke-") as work:
+        work = Path(work)
+        cask = work / "marathon.rb"
+        prepare(args.dist.resolve(), cask)
+        binary = suite["unpack"](args.dist.resolve(), work)
+        brew("ruby", str(ROOT / "scripts/homebrew-quarantine-smoke.rb"), str(cask), str(binary))
+    if args.quarantine_only:
+        return
 
     prefix = Path(brew("--prefix", capture_output=True, text=True).stdout.strip())
     repository = Path(brew("--repository", capture_output=True, text=True).stdout.strip())
@@ -70,9 +91,16 @@ def main():
         if "trust" in brew("commands", "--quiet", capture_output=True, text=True).stdout.split():
             brew("trust", "--cask", cask_name)
             trusted = True
+        brew("fetch", "--cask", "--quarantine", str(cask))
+        cached = Path(brew("--cache", "--cask", str(cask), capture_output=True, text=True).stdout.strip())
+        # A file:// snapshot must exercise the same quarantine path as a download.
+        quarantine = os.getxattr(cached, "com.apple.quarantine").decode("ascii")
+        if not quarantine or int(quarantine.split(";", 1)[0], 16) & 0x0040:
+            raise RuntimeError("expected a quarantined download without prior user approval")
         attempted_install = True
-        brew("install", "--cask", str(cask))
-        suite = runpy.run_path(str(ROOT / "scripts/release-smoke.py"))
+        brew("install", "--cask", "--quarantine", str(cask))
+        if "com.apple.quarantine" in os.listxattr(installed.resolve()):
+            raise RuntimeError("installed binary is still quarantined")
         with tempfile.TemporaryDirectory(prefix="marathon-installed-smoke-") as work:
             suite["smoke"](installed, Path(work))
         for completion in completions:

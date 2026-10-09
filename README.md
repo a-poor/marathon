@@ -367,7 +367,10 @@ They verify checksums and archive contents, then test the extracted binaries:
 startup, completions, scaffolding, and validation on all targets; execution,
 partial selection, raw output, exit status, and scratch cleanup on Linux/macOS.
 On macOS, they also install the generated Homebrew cask from the local snapshot,
-run the installed executable, verify shell completions, and uninstall it.
+verify that the download is quarantined and the install hook clears quarantine
+before completion generation, run the installed executable, verify shell
+completions, and uninstall it. Hook ordering is checked independently of whether
+Gatekeeper is enabled on the runner.
 Windows checks do not imply native shell execution support. These checks do not
 publish releases, update the Homebrew tap, or automate the interactive TUI.
 
@@ -409,6 +412,13 @@ cask without installing it:
 
 ```sh
 python scripts/homebrew-smoke.py target/release-smoke --prepare-only target/marathon.rb
+```
+
+On macOS, test the generated hooks against a quarantined copy of the packaged
+binary without changing your Homebrew installation:
+
+```sh
+python scripts/homebrew-smoke.py target/release-smoke --quarantine-only
 ```
 
 To refresh the README demo, install [VHS](https://github.com/charmbracelet/vhs), then
