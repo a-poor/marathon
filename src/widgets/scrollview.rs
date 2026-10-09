@@ -298,49 +298,20 @@ fn build_document(
 /// is selected, the draw loop overpaints the box border [`Color::Blue`] instead.
 const HEADER_BORDER: Color = Color::Indexed(240);
 
-/// The runbook header banner: a full box (border all around, `marathon` in the top
-/// edge) framing the runner ASCII art on the left and, on the right, the `marathon`
-/// wordmark stacked above the title / path / description / env fields. Selectable
-/// block 0; scrolls with the document.
+/// The runbook header banner: a full box with the `marathon` wordmark stacked above
+/// the title / path / description / env fields. Selectable block 0; scrolls with
+/// the document.
 fn header_lines(book: &Runbook, width: usize) -> Vec<Line<'static>> {
-    let art = runner_art();
-    let art_w = art.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-
-    // Right column: the big wordmark, a blank line, then the frontmatter fields.
-    let wordmark = wordmark_lines();
-    let wordmark_w = wordmark.iter().map(Line::width).max().unwrap_or(0);
-    let mut right = wordmark;
-    right.push(Line::default());
-    right.extend(header_fields(book));
-
-    // Drop the runner on narrow terminals so it can't crowd out the wordmark: it's
-    // shown only when the box has room for both (plus borders, the column gap, and a
-    // small margin). Below that, just the wordmark + fields.
-    let show_art = width >= art_w + wordmark_w + 7;
-    let gap = if show_art { 3 } else { 0 };
+    let mut content = wordmark_lines();
+    content.push(Line::default());
+    content.extend(header_fields(book));
 
     let border = Style::new().fg(HEADER_BORDER);
     let mut lines = vec![box_top("marathon", width, border)];
 
-    let rows = if show_art {
-        art.len().max(right.len())
-    } else {
-        right.len()
-    };
-    for i in 0..rows {
-        // Left border, the (optional) art column padded to its width and a gap, then
-        // the right column (wordmark / fields).
+    for line in content {
         let mut inner = vec![Span::styled("│", border), Span::raw(" ")];
-        if show_art {
-            inner.push(Span::styled(
-                format!("{:<art_w$}", art.get(i).map(String::as_str).unwrap_or("")),
-                Style::new().fg(Color::Cyan),
-            ));
-            inner.push(Span::raw(" ".repeat(gap)));
-        }
-        if let Some(line) = right.get(i) {
-            inner.extend(line.spans.iter().cloned());
-        }
+        inner.extend(line.spans);
         // Fit the inner content to width-1 columns, then cap with the right border.
         let mut spans = fit_to(inner, width.saturating_sub(1));
         spans.push(Span::styled("│", border));
@@ -467,58 +438,6 @@ fn wordmark_lines() -> Vec<Line<'static>> {
     raw[start..end]
         .iter()
         .map(|l| Line::from(l.trim_end().to_string().bold()))
-        .collect()
-}
-
-/// The runner ASCII art for the header, with surrounding blank lines stripped and the
-/// common left indent removed.
-fn runner_art() -> Vec<String> {
-    const ART: &str = r#"
-                        kfv,
-                       c'>C|8
-                       p0&C;\
-                      }hndkM
-                 j>{]MX@!wL8W
-              fY]iCmjWCiZ[1*I
-             Xkv   CW'Mxo[^t
-             t&>   !v}j*X<M;<]O@)&
-             +^    .i>Yn%b'0~},_
-             Ud   }+Wa:~b
-             1jb ~mCBlU&1
-                 [Iz^]uzh
-                 Z(}l+8#mqZ
-      ,I8        +X'u]~Xn"_C
-    {j~`f~_ai    \~ZWI`>Uj~X{
-         QC;t^adcI]`@O  n&;Cp(8
-             qaqJm{#       C`mB
-                 c+        *+Cf
-                           vBzt/
-                             [r)
-                              .!~
-                              "Yok,
-                               C]koM<
-"#;
-    let raw: Vec<&str> = ART.lines().collect();
-    // Trim fully-blank leading/trailing lines.
-    let start = raw.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
-    let end = raw
-        .iter()
-        .rposition(|l| !l.trim().is_empty())
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let body = &raw[start..end];
-    // Remove the common left indent.
-    let indent = body
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
-        .min()
-        .unwrap_or(0);
-    body.iter()
-        .map(|l| {
-            let dedented = if l.len() >= indent { &l[indent..] } else { l };
-            dedented.trim_end().to_string()
-        })
         .collect()
 }
 
@@ -905,34 +824,6 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
             shown.contains(&format!("TMP_DIR: {}", dir.display())),
             "temp dir path missing: {shown}"
         );
-    }
-
-    #[test]
-    fn header_hides_runner_on_narrow_terminals() {
-        let book = Runbook::new(Some("book.md"), "---\ntitle: T\n---\n\n# Hi\n").unwrap();
-        let join = |w| {
-            header_lines(&book, w)
-                .iter()
-                .map(line_text)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        // '@' is a distinctive runner glyph, absent from the wordmark and fields.
-        assert!(
-            join(100).contains('@'),
-            "runner should show on a wide terminal"
-        );
-
-        let narrow = join(50);
-        assert!(
-            !narrow.contains('@'),
-            "runner should be hidden when narrow: {narrow}"
-        );
-        assert!(
-            narrow.contains("Title: T"),
-            "title should remain when narrow"
-        );
-        assert!(narrow.contains("marathon"), "wordmark label should remain");
     }
 
     #[test]
