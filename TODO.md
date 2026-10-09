@@ -8,11 +8,6 @@ Keep runbooks ordinary Markdown and update the README, design, samples, and
 bundled authoring skill when behavior changes.
 Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 
-### 1. Release checks
-
-- Exercise Homebrew installation and the generated cask end to end. Archive smoke
-  checks cover the executable and completion commands, but not installation.
-
 ## Reliability and portability
 
 - Implement native Windows interpreter discovery and process-tree cleanup (for
@@ -33,7 +28,9 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 
 ## Interaction and scope
 
-- Add text search and a heading outline/jump action for navigating long runbooks.
+- Add a heading outline/jump action for navigating long runbooks.
+- Consider search across wrapped lines and unloaded output pages if needed; current
+  search covers individual rendered lines and bounded output tails/pages.
 - Multi-select inputs and a real terminal cursor for text editing.
 - Improve light/dark theme contrast and richer Markdown rendering.
 - Revisit interpreter command quoting and unsupported/custom interpreter behavior.
@@ -70,6 +67,10 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
   selection, raw output, failure status, and scratch cleanup; Windows checks archive
   contents, startup, completions, scaffolding, and validation only. Snapshots never
   publish releases or update the Homebrew tap.
+- macOS snapshot cask installation, installed CLI/completion checks, and uninstall
+  cleanup on disposable Homebrew runners.
+- TUI `/` search with live highlights, match counts, `n`/`N` wraparound, and
+  cancel/restore; README demo regenerated through `demo.tape`.
 - Shared CLI/TUI answer validation, strict option-file errors, editable TUI errors,
   and source/cell diagnostics for invalid targets and defaults. File-dependent
   checks are deferred until the input is reached; regression tests cover missing,

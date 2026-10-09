@@ -5,7 +5,7 @@ use anyhow::Result;
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind},
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Style, Stylize},
     text::{Line, Span},
 };
@@ -13,12 +13,12 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
 use crate::{
-    book::{BookBlock, Cancel, CodeBlockState, MagicInputBlock, Runbook},
+    book::{BookBlock, Cancel, CodeBlockState, MagicInputBlock, Runbook, TextDraft},
     runner::{self, RunMsg},
     widgets::{
         footer::{FooterWidget, Status},
         help::HelpModal,
-        scrollview::{DocumentView, ScrollState},
+        scrollview::{DocumentView, ScrollState, SearchBookmark},
     },
 };
 
@@ -30,12 +30,18 @@ enum Mode {
     Active,
 }
 
+struct SearchEdit {
+    draft: TextDraft,
+    bookmark: SearchBookmark,
+}
+
 /// Interactive runbook viewer and owner of all active cell tasks.
 pub struct App {
     book: Runbook,
     scroll: ScrollState,
     /// Navigate vs. actively editing the focused input cell.
     mode: Mode,
+    search_edit: Option<SearchEdit>,
     /// Whether the hotkeys help modal is open (overlays any mode).
     show_help: bool,
     /// Whether cell outputs show bounded pages instead of the live tail.
@@ -79,6 +85,7 @@ impl App {
             book,
             scroll: ScrollState::new(),
             mode: Mode::Navigate,
+            search_edit: None,
             show_help: false,
             verbose: false,
             revision: 0,
@@ -163,12 +170,48 @@ impl App {
             &mut self.scroll,
         );
 
-        frame.render_widget(self.footer(), footer);
+        if let Some(search) = &self.search_edit {
+            self.draw_search(frame, footer, &search.draft);
+        } else {
+            frame.render_widget(self.footer(), footer);
+        }
 
         // The help modal floats over everything when open.
         if self.show_help {
             frame.render_widget(HelpModal, frame.area());
         }
+    }
+
+    fn draw_search(&self, frame: &mut Frame, area: Rect, draft: &TextDraft) {
+        if area.is_empty() {
+            return;
+        }
+        let hint = format!(
+            " {} • Enter accept • Esc cancel",
+            self.scroll.search_count()
+        );
+        let hint_width = if area.width > 50 {
+            Line::raw(&hint).width() as u16
+        } else {
+            0
+        };
+        let [prompt, status] =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(hint_width)]).areas(area);
+        let cursor = draft.byte_at(draft.cursor);
+        let mut start = 0;
+        // Keep the insertion point visible, measuring terminal columns rather
+        // than bytes or character count (wide and accented text can differ).
+        let available = prompt.width.saturating_sub(2) as usize;
+        while start < cursor && Line::raw(&draft.value[start..cursor]).width() > available {
+            start += draft.value[start..].chars().next().unwrap().len_utf8();
+        }
+        frame.render_widget(
+            Line::from(format!("/{}", &draft.value[start..])).cyan(),
+            prompt,
+        );
+        frame.render_widget(Line::from(hint).dim(), status);
+        let x = 1 + Line::raw(&draft.value[start..cursor]).width() as u16;
+        frame.set_cursor_position((prompt.x + x.min(prompt.width - 1), prompt.y));
     }
 
     /// Build the footer for this frame: a run-state badge (left), run counts
@@ -192,7 +235,10 @@ impl App {
             Mode::Navigate if self.sequence.is_some() => {
                 Line::from("running remaining • backspace stop • q quit")
             }
-            Mode::Navigate => Line::from("↑/↓ move • ↵ run • r remaining • ? help"),
+            Mode::Navigate if !self.scroll.search_query().is_empty() => {
+                Line::from("n/N match • esc clear • ↵ run • ? help")
+            }
+            Mode::Navigate => Line::from("↑/↓ move • ↵ run • r remaining • / search • ? help"),
             Mode::Active => Line::from("↵ submit • esc cancel • ←/→ edit"),
         };
 
@@ -204,6 +250,12 @@ impl App {
         // A transient flash (e.g. "copied") takes over the center while it's active.
         if let Some(msg) = self.flash_active() {
             footer = footer.flash(Line::from(msg.to_owned()));
+        } else if !self.scroll.search_query().is_empty() {
+            footer = footer.flash(Line::from(format!(
+                "/{} · {}",
+                self.scroll.search_query(),
+                self.scroll.search_count(),
+            )));
         }
         footer
     }
@@ -249,6 +301,10 @@ impl App {
                 }
                 return;
             }
+            if self.search_edit.is_some() {
+                self.handle_search_key(key);
+                return;
+            }
             match self.mode {
                 Mode::Navigate => self.handle_navigate_key(key),
                 Mode::Active => self.handle_active_key(key),
@@ -282,6 +338,9 @@ impl App {
         let page = (self.viewport_h / 2).max(1);
 
         match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) if !self.scroll.search_query().is_empty() => {
+                self.scroll.search_for(String::new());
+            }
             (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => self.exit = true,
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => self.exit = true,
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.scroll.select_next(len),
@@ -308,8 +367,65 @@ impl App {
             (KeyCode::Char('x'), _) => self.clear_selected(),
             (KeyCode::Char('X'), _) => self.clear_all(),
             (KeyCode::Char('?'), _) => self.show_help = true,
+            (KeyCode::Char('/'), _) => self.start_search(),
+            (KeyCode::Char('n' | 'N'), _) => {
+                if self.scroll.search_query().is_empty() {
+                    self.notice("press / to search");
+                } else {
+                    self.scroll.search_next(key.code == KeyCode::Char('N'));
+                    self.scroll
+                        .resolve_search(&self.book, self.revision, self.verbose);
+                }
+            }
             _ => {}
         }
+    }
+
+    fn start_search(&mut self) {
+        // Run-remaining owns selection and can activate an input when a command
+        // finishes. Do not let a search preview change that editor's target.
+        if self.sequence.is_some() {
+            self.notice("stop run remaining before searching");
+            return;
+        }
+        self.flash = None;
+        self.search_edit = Some(SearchEdit {
+            draft: TextDraft::seeded(self.scroll.search_query().to_owned()),
+            bookmark: self.scroll.search_bookmark(),
+        });
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            let edit = self.search_edit.take().expect("search editor is open");
+            self.scroll.restore_search(edit.bookmark);
+            return;
+        }
+        if key.code == KeyCode::Enter {
+            self.search_edit = None;
+            return;
+        }
+        let draft = &mut self
+            .search_edit
+            .as_mut()
+            .expect("search editor is open")
+            .draft;
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('u'), KeyModifiers::CONTROL) => *draft = TextDraft::default(),
+            (KeyCode::Char(ch), KeyModifiers::NONE | KeyModifiers::SHIFT) if !ch.is_control() => {
+                draft.insert(ch);
+            }
+            (KeyCode::Backspace, _) => draft.backspace(),
+            (KeyCode::Delete, _) => draft.delete(),
+            (KeyCode::Left, _) => draft.left(),
+            (KeyCode::Right, _) => draft.right(),
+            (KeyCode::Home, _) => draft.home(),
+            (KeyCode::End, _) => draft.end(),
+            _ => {}
+        }
+        self.scroll.search_for(draft.value.clone());
+        self.scroll
+            .resolve_search(&self.book, self.revision, self.verbose);
     }
 
     /// Enter edits an input in place, or starts code and advances to the next
@@ -792,6 +908,122 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.handle_event(&Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn search_keys_preview_accept_cancel_and_never_execute_cells() {
+        let mut app = app("echo qrX界\necho qrX界");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 12)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        press(&mut app, KeyCode::Char('/'));
+        for ch in "qrX界".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(app.scroll.search_count(), "1/2");
+        assert!(!app.exit);
+        assert!(app.runs.is_empty());
+        assert!(app.sequence.is_none());
+        press(&mut app, KeyCode::Enter);
+        assert!(app.search_edit.is_none());
+        assert!(
+            app.runs.is_empty(),
+            "accepting a search does not run the match"
+        );
+        press(&mut app, KeyCode::Char('n'));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(app.scroll.search_count(), "2/2");
+        press(&mut app, KeyCode::Char('N'));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(app.scroll.search_count(), "1/2");
+
+        press(&mut app, KeyCode::Char('/'));
+        app.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )));
+        press(&mut app, KeyCode::Char('z'));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(app.scroll.search_count(), "no matches");
+        press(&mut app, KeyCode::Esc);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(app.scroll.search_query(), "qrX界");
+        assert_eq!(app.scroll.search_count(), "1/2");
+        assert!(!app.exit);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.scroll.search_query().is_empty());
+        assert!(!app.exit);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.exit);
+    }
+
+    #[test]
+    fn accepting_search_then_editing_without_a_frame_uses_the_matching_input() {
+        let doc = "```json mrthn=input\n{\"type\":\"input\",\"prompt\":\"Unique label\",\"target\":\"NAME\"}\n```";
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        // Deliberately do not draw between key events, like a burst of terminal
+        // input between timer ticks. Search must resolve selection synchronously.
+        press(&mut app, KeyCode::Char('/'));
+        for ch in "Unique label".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.mode, Mode::Active);
+        assert_eq!(app.selected_block(), Some(0));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(app.selected_block(), Some(0));
+        press(&mut app, KeyCode::Char('A'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.book.input_at_mut(0).unwrap().resolved().unwrap().1, "A");
+    }
+
+    #[test]
+    fn search_editor_handles_unicode_and_tiny_terminals_and_global_quit() {
+        let mut app = app("echo test");
+        press(&mut app, KeyCode::Char('/'));
+        for ch in "界éabc".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.scroll.search_query(), "abc");
+        press(&mut app, KeyCode::End);
+        for width in [1, 2, 4, 12, 80] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 3)).unwrap();
+            terminal.draw(|frame| app.draw(frame)).unwrap();
+        }
+        app.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.exit);
+    }
+
+    #[test]
+    fn search_does_not_take_over_an_input_or_running_sequence() {
+        let doc = "```json mrthn=input\n{\"type\":\"input\",\"prompt\":\"Name?\",\"target\":\"NAME\"}\n```";
+        let mut app = App::new(Runbook::new(None::<&str>, doc).unwrap());
+        app.scroll.select_index(1, 2);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('/'));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(app.search_edit.is_none());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.book.input_at_mut(0).unwrap().resolved().unwrap().1,
+            "/n"
+        );
+        app.sequence = Some(0);
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.search_edit.is_none());
+        assert!(app.flash_active().unwrap().contains("stop run remaining"));
     }
 
     #[tokio::test]

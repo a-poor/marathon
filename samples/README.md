@@ -16,3 +16,5 @@ Open one with `marathon run samples/<file>.md`, or execute it sequentially with
 
 `demo.md` is intended for manually stepping through the TUI. Its input has no
 unattended default and its failure cell intentionally stops `exec`.
+The README recording uses `demo.tape`: `r` pauses at the name input, continues to
+the intentional failure, then `/step` and `n`/`N` demonstrate search navigation.

@@ -22,7 +22,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", nargs="?", help="omit to print the CI matrix")
     args = parser.parse_args()
-    config = yaml.safe_load((ROOT / ".goreleaser.yaml").read_text())
+    config = yaml.safe_load((ROOT / ".goreleaser.yaml").read_text(encoding="utf-8"))
     targets = []
     for build in config["builds"]:
         if build["builder"] != "rust":
@@ -52,7 +52,7 @@ def main():
     config["dist"] = "target/release-smoke"
     output = ROOT / "target/release-smoke.yaml"
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(yaml.safe_dump(config, sort_keys=False))
+    output.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     print(output)
 
 

@@ -1,6 +1,6 @@
 ---
 title: Hello, Marathon
-description: The smallest useful runbook — frontmatter env, a runnable cell, a skipped cell.
+description: Run shell cells, collect answers, and search an ordinary Markdown document.
 env:
   GREETING: "Hello"
   WHO: "world"
@@ -96,6 +96,4 @@ echo eight >&2
 echo nine
 echo ten >&2
 ```
-
-abcdef
 

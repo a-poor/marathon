@@ -875,13 +875,13 @@ pub struct TextDraft {
 }
 
 impl TextDraft {
-    fn seeded(value: String) -> Self {
+    pub(crate) fn seeded(value: String) -> Self {
         let cursor = value.chars().count();
         Self { value, cursor }
     }
 
     /// Byte offset of char index `idx` (clamped to the end).
-    fn byte_at(&self, idx: usize) -> usize {
+    pub(crate) fn byte_at(&self, idx: usize) -> usize {
         self.value
             .char_indices()
             .nth(idx)
@@ -893,13 +893,13 @@ impl TextDraft {
         self.value.chars().count()
     }
 
-    fn insert(&mut self, c: char) {
+    pub(crate) fn insert(&mut self, c: char) {
         let at = self.byte_at(self.cursor);
         self.value.insert(at, c);
         self.cursor += 1;
     }
 
-    fn backspace(&mut self) {
+    pub(crate) fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
         }
@@ -909,7 +909,7 @@ impl TextDraft {
         self.cursor -= 1;
     }
 
-    fn delete(&mut self) {
+    pub(crate) fn delete(&mut self) {
         if self.cursor >= self.char_count() {
             return;
         }
@@ -918,19 +918,19 @@ impl TextDraft {
         self.value.replace_range(start..end, "");
     }
 
-    fn left(&mut self) {
+    pub(crate) fn left(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
 
-    fn right(&mut self) {
+    pub(crate) fn right(&mut self) {
         self.cursor = (self.cursor + 1).min(self.char_count());
     }
 
-    fn home(&mut self) {
+    pub(crate) fn home(&mut self) {
         self.cursor = 0;
     }
 
-    fn end(&mut self) {
+    pub(crate) fn end(&mut self) {
         self.cursor = self.char_count();
     }
 }

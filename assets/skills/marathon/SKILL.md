@@ -201,6 +201,12 @@ Disk failures are reported on the cell; write failures stop its command. Use she
 redirection or `marathon exec ... > run.log` when output must survive the session.
 CLI output remains byte-preserving and streaming.
 
+In navigation mode, `/` searches rendered lines literally and case-insensitively;
+Enter accepts the query, `n`/`N` wrap through matches, and Esc clears it. Esc while
+editing search restores the previous query and position; Ctrl-U clears the draft.
+Search includes prose, source, inputs, and current output tails/pages; it does not
+span wrapped lines or load entire captures. Stop run-remaining before searching.
+
 When editing a runbook, you can sanity-check it with `marathon validate <file>`.
 
 In the TUI, `r` runs all unfinished cells sequentially from the first unfinished

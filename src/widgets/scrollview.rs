@@ -21,6 +21,7 @@ use crate::book::{
     BookBlock, Cancel, CodeBlock, CodeBlockState, Draft, InputCell, InputState, Runbook,
 };
 use crate::widgets::markdown::render_md;
+use crate::widgets::search::{Hit, Search};
 use crate::widgets::wrap::{hard_break, wrap};
 
 /// Persisted scroll/selection state for the document view.
@@ -38,6 +39,14 @@ pub struct ScrollState {
     last_selected_end: Option<usize>,
     /// Wrapped-document cache, keyed on width + revision.
     cache: Option<Cache>,
+    search: Search,
+    search_reveal: Option<Hit>,
+}
+
+pub(crate) struct SearchBookmark {
+    selected: usize,
+    offset: usize,
+    search: Search,
 }
 
 struct Cache {
@@ -54,6 +63,59 @@ impl ScrollState {
 
     pub fn selected(&self) -> usize {
         self.selected
+    }
+
+    pub(crate) fn search_query(&self) -> &str {
+        &self.search.query
+    }
+
+    pub(crate) fn search_count(&self) -> String {
+        self.search.count_label()
+    }
+
+    pub(crate) fn search_for(&mut self, query: String) {
+        self.search.set_query(query);
+    }
+
+    pub(crate) fn search_next(&mut self, backwards: bool) {
+        self.search.step(backwards);
+    }
+
+    /// Resolve navigation before another key can execute or edit the selection.
+    /// Deferring this entirely to draw would let fast Enter/r keys act on the
+    /// previous cell, then move focus underneath an active input editor.
+    pub(crate) fn resolve_search(&mut self, book: &Runbook, revision: u64, verbose: bool) {
+        let width = self.cache.as_ref().map_or(80, |cache| cache.width);
+        self.ensure_cache(book, width, revision, verbose);
+        self.update_search();
+    }
+
+    fn update_search(&mut self) {
+        let cache = self.cache.as_ref().expect("cache populated above");
+        if let Some(hit) = self
+            .search
+            .update(&cache.lines, &cache.ranges, self.selected)
+        {
+            self.selected = hit.block;
+            self.search_reveal = Some(hit);
+        }
+    }
+
+    pub(crate) fn search_bookmark(&self) -> SearchBookmark {
+        SearchBookmark {
+            selected: self.selected,
+            offset: self.offset,
+            search: self.search.clone(),
+        }
+    }
+
+    pub(crate) fn restore_search(&mut self, bookmark: SearchBookmark) {
+        self.selected = bookmark.selected;
+        self.offset = bookmark.offset;
+        self.last_selected = Some(self.selected);
+        self.search_reveal = None;
+        self.search = bookmark.search;
+        self.search.dirty = true;
     }
 
     pub fn select_next(&mut self, len: usize) {
@@ -101,6 +163,7 @@ impl ScrollState {
             None => true,
         };
         if stale {
+            self.search.dirty = true;
             let (lines, ranges) = build_document(book, width, verbose);
             self.cache = Some(Cache {
                 width,
@@ -154,6 +217,12 @@ impl StatefulWidget for DocumentView<'_> {
         }
         state.ensure_cache(self.book, area.width, self.revision, self.verbose);
 
+        state.update_search();
+        let search_jump = state
+            .search_reveal
+            .take()
+            .filter(|hit| hit.block == state.selected);
+
         let h = area.height as usize;
         let (total, range, selected) = {
             let cache = state.cache.as_ref().expect("cache populated above");
@@ -171,11 +240,19 @@ impl StatefulWidget for DocumentView<'_> {
         // between frames (its last output + the finish landing together) is still
         // followed all the way to its tail. (Selection index 0 is the header, so a
         // block's index `b` sits at selection `b + 1`.)
-        let following_run = self.book.last_run.map(|b| b + 1) == Some(selected);
+        let following_run =
+            state.search.query.is_empty() && self.book.last_run.map(|b| b + 1) == Some(selected);
 
         let changed = state.last_selected != Some(selected);
         let mut off = state.offset;
-        if changed {
+        if let Some(hit) = search_jump {
+            // Reveal the matching line even when its cell is taller than the
+            // viewport. Normal selection scrolling would only reveal the top.
+            let line = (range.start + hit.row).min(range.end.saturating_sub(1));
+            if line < off || line >= off + h {
+                off = line.saturating_sub(h / 2);
+            }
+        } else if changed {
             // Selection just moved: scroll the block into view. (Wheel scrolling is
             // left alone otherwise.)
             if range.start < off {
@@ -241,6 +318,23 @@ impl StatefulWidget for DocumentView<'_> {
             } else {
                 buf.set_style(Rect::new(area.x, y, area.width, 1), hl);
             }
+        }
+        for (index, hit) in state.search.hits.iter().enumerate() {
+            let line = cache.ranges[hit.block].start + hit.row;
+            if line < off || line >= off + h {
+                continue;
+            }
+            let start = hit.columns.start.min(area.width as usize) as u16;
+            let end = hit.columns.end.min(area.width as usize) as u16;
+            let color = if state.search.current == Some(index) {
+                Color::Cyan
+            } else {
+                Color::Yellow
+            };
+            buf.set_style(
+                Rect::new(area.x + start, area.y + (line - off) as u16, end - start, 1),
+                Style::new().fg(Color::Black).bg(color),
+            );
         }
     }
 }
@@ -877,6 +971,45 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
         // Heading text should appear somewhere in the rendered buffer.
         let dump = format!("{:?}", term.backend().buffer());
         assert!(dump.contains("heading"), "heading not rendered");
+    }
+
+    #[test]
+    fn search_reveals_and_highlights_a_match_deep_in_a_tall_cell() {
+        let doc = format!("```sh\n{}echo needle\n```", "echo filler\n".repeat(40));
+        let book = Runbook::new(None::<&str>, &doc).unwrap();
+        let mut term = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        let mut state = ScrollState::new();
+        state.search_for("NEEDLE".into());
+        term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 0), f.area(), &mut state))
+            .unwrap();
+        assert_eq!(state.selected(), 1);
+        assert_eq!(state.search_count(), "1/1");
+        let hit = &state.search.hits[0];
+        let line = state.cache.as_ref().unwrap().ranges[1].start + hit.row;
+        assert!(line >= state.offset && line < state.offset + 8);
+        let cell =
+            &term.backend().buffer()[(hit.columns.start as u16, (line - state.offset) as u16)];
+        assert_eq!(cell.symbol(), "n");
+        assert_eq!(cell.bg, Color::Cyan);
+
+        let bookmark = state.search_bookmark();
+        let offset = state.offset;
+        state.search_for("filler".into());
+        term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 0), f.area(), &mut state))
+            .unwrap();
+        assert!(state.offset < offset);
+        state.restore_search(bookmark);
+        term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 0), f.area(), &mut state))
+            .unwrap();
+        assert_eq!(state.offset, offset);
+        assert_eq!(state.search_query(), "NEEDLE");
+
+        // Rewrapping reindexes matches; the next jump still reveals the hit.
+        term.resize(Rect::new(0, 0, 15, 6)).unwrap();
+        state.search_next(false);
+        term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 1), f.area(), &mut state))
+            .unwrap();
+        assert!(format!("{:?}", term.backend().buffer()).contains("needle"));
     }
 
     #[test]

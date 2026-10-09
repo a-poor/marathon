@@ -247,6 +247,8 @@ files, and unattended command flags to keep execution predictable.
 | `↑` / `↓`, `k` / `j` | Move selection |
 | `g` / `G`, Home / End | First / last cell |
 | Ctrl-U / Ctrl-D, Page Up / Page Down | Scroll half a page |
+| `/` | Search the rendered document; Enter accepts, Esc cancels the preview |
+| `n` / `N` | Next / previous search match (wraps around) |
 | Enter | Run code and advance; edit an input in place, then submit and advance |
 | `r` | Run remaining unfinished cells sequentially, from the first unfinished cell |
 | Backspace | Stop run remaining / interrupt selected manual run; press again to force-kill it |
@@ -255,8 +257,15 @@ files, and unattended command flags to keep execution predictable.
 | `y` / `Y` | Copy cell source / cleaned output |
 | `x` / `X` | Clear selected cell / reset all cells and automatic scratch space |
 | `?` | Show help |
-| `q` / Esc | Quit navigation; Esc cancels an input edit or closes help |
+| `q` / Esc | Quit navigation; Esc first clears search, cancels an edit, or closes help |
 | Ctrl-C | Quit from any mode |
+
+Search is literal and case-insensitive, with live highlighting and a match count.
+It searches each rendered line of prose, cell source, inputs, and the current
+output tails/pages. Matches do not span wrapped lines; expand/page output to search
+other parts of a capture. `/` edits the previous query; Ctrl-U clears it. Canceling
+the preview restores the previous query and position. Stop run-remaining before
+opening search; cell input editors continue to treat `/`, `n`, and `N` as input.
 
 Advancement skips prose and display-only code and stays on the last actionable
 cell at the end. It happens when a run starts, without waiting for completion or
@@ -357,8 +366,10 @@ configuration and build snapshot archives for every configured release target.
 They verify checksums and archive contents, then test the extracted binaries:
 startup, completions, scaffolding, and validation on all targets; execution,
 partial selection, raw output, exit status, and scratch cleanup on Linux/macOS.
+On macOS, they also install the generated Homebrew cask from the local snapshot,
+run the installed executable, verify shell completions, and uninstall it.
 Windows checks do not imply native shell execution support. These checks do not
-publish releases, update the Homebrew tap, or test Homebrew installation/the TUI.
+publish releases, update the Homebrew tap, or automate the interactive TUI.
 
 Run the same checks locally:
 
@@ -376,6 +387,7 @@ Python virtual environment for the release tools. From the repository root:
 python3 -m venv target/release-tools
 . target/release-tools/bin/activate
 python -m pip install -r scripts/release-smoke-requirements.txt
+export CARGO_ZIGBUILD_PYTHON_PATH=python
 goreleaser check
 python scripts/release-config.py aarch64-apple-darwin # use your native release target
 goreleaser release --snapshot --clean --skip=before --config target/release-smoke.yaml
@@ -388,3 +400,22 @@ installation hooks are skipped because the toolchain is already provisioned.
 macOS artifacts use native `cargo build` and Apple's linker to avoid duplicate
 framework links in Zig-built binaries. Full releases therefore need a macOS build
 host; Linux/Windows targets continue to use `cargo zigbuild`.
+
+The Homebrew installation test runs only on disposable GitHub-hosted macOS runners
+and refuses to replace an existing installation. To inspect its generated local
+cask without installing it:
+
+```sh
+python scripts/homebrew-smoke.py target/release-smoke --prepare-only target/marathon.rb
+```
+
+To refresh the README demo, install [VHS](https://github.com/charmbracelet/vhs), then
+record the current local build from the repository root:
+
+```sh
+cargo build --locked
+PATH="$PWD/target/debug:$PATH" vhs demo.tape
+```
+
+The tape writes `assets/demo.gif` and demonstrates run-remaining, input selection,
+failure handling, and search. Review the recording after changing the TUI or sample.

@@ -23,6 +23,7 @@ const SECTIONS: &[Section] = &[
             ("j / k   ↓ / ↑", "move selection"),
             ("g / G", "first / last cell"),
             ("Ctrl-d / Ctrl-u", "half-page down / up"),
+            ("/   n / N", "search · next / previous match"),
             ("Enter", "run & advance · edit input"),
             ("r", "run remaining in order"),
             ("Backspace", "stop sequence / run (×2 kill)"),
@@ -32,7 +33,8 @@ const SECTIONS: &[Section] = &[
             ("Y", "copy cell output to clipboard"),
             ("x / X", "clear cell / clear all"),
             ("?", "toggle this help"),
-            ("q   Esc   Ctrl-c", "quit"),
+            ("Esc", "clear search / quit"),
+            ("q   Ctrl-c", "quit"),
         ],
     },
     Section {
@@ -112,12 +114,24 @@ impl Widget for HelpModal {
         let inner = block.inner(popup);
         block.render(popup, buf);
 
-        for (i, line) in lines.into_iter().enumerate() {
+        // Keep the dismissal hint visible even when a short terminal clips rows.
+        let body_height = inner.height.saturating_sub(1) as usize;
+        for (i, line) in lines
+            .iter()
+            .take(lines.len() - 1)
+            .take(body_height)
+            .enumerate()
+        {
             let y = inner.y + i as u16;
-            if y >= inner.bottom() {
-                break;
-            }
-            buf.set_line(inner.x, y, &line, inner.width);
+            buf.set_line(inner.x, y, line, inner.width);
+        }
+        if inner.height > 0 {
+            buf.set_line(
+                inner.x,
+                inner.bottom() - 1,
+                lines.last().unwrap(),
+                inner.width,
+            );
         }
     }
 }

@@ -124,6 +124,17 @@ Input errors retain the editable draft and inline diagnostic but release sequenc
 ownership; correcting the answer does not automatically resume the stopped run.
 Owners remain installed through Finished; messages without owners are ignored.
 
+`/` opens a separate search draft in navigation mode. Literal, case-insensitive
+matches cover rendered lines (including current bounded output windows), never
+whole output spools. Query/content/width changes invalidate the match index;
+ordinary animation frames reuse it. Highlighting is a draw-time overlay, with
+Unicode byte offsets mapped to display columns. `n`/`N` wrap through matches and
+reveal the exact row even within a cell taller than the viewport. Search disables
+output tail-follow while a query is present. Enter accepts without running a cell;
+Esc restores the prior query/selection/scroll during editing, or clears an accepted
+query before quitting. Run-remaining prevents opening search because it owns
+selection/input focus. Input-cell editors retain their normal character handling.
+
 On Unix each cell leads a new process group. Backspace requests SIGINT; a second
 press requests SIGKILL. A stop requested before spawn is retained. Quit, terminal
 errors, CLI interruption, and output failures force cleanup and await the task
@@ -275,5 +286,10 @@ checksums, then runs the extracted executable in a disposable directory. All
 targets cover startup, completions, scaffolding, and validation; Linux/macOS also
 cover execution, partial selection, byte fidelity, failure status, and scratch
 cleanup. Windows execution remains unsupported by these checks. Snapshot builds
-do not publish releases or update the Homebrew tap; installation through Homebrew
-and the interactive TUI still need separate verification.
+do not publish releases or update the Homebrew tap. On disposable macOS runners,
+the generated cask's URL is redirected to the local snapshot archive; its checksum,
+DSL, hooks, and completion declarations remain intact. The test installs it into
+Homebrew, reruns executable checks, verifies installed completions, and uninstalls,
+checking that the binary, completions, and cask directory are removed. Existing
+installations are never replaced. The interactive TUI is covered by model/rendering
+tests and manual review of the VHS recording produced from `demo.tape`.
