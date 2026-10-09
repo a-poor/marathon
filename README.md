@@ -400,6 +400,8 @@ installation hooks are skipped because the toolchain is already provisioned.
 macOS artifacts use native `cargo build` and Apple's linker to avoid duplicate
 framework links in Zig-built binaries. Full releases therefore need a macOS build
 host; Linux/Windows targets continue to use `cargo zigbuild`.
+Windows-only snapshots omit Homebrew cask generation because they contain only a
+Windows ZIP. Linux/macOS snapshots retain the release cask configuration.
 
 The Homebrew installation test runs only on disposable GitHub-hosted macOS runners
 and refuses to replace an existing installation. To inspect its generated local

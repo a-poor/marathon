@@ -43,12 +43,16 @@ def main():
     if args.target not in targets:
         parser.error(f"not a configured release target: {args.target}")
 
-    # Keep the release builder, flags, archive rules, and packaging settings.
-    # Only narrow the targets and isolate generated files from real releases.
+    # Keep the release builder, flags, and archive rules. Narrow the targets and
+    # isolate generated files from real releases.
     config["builds"] = [
         {**build, "targets": [args.target]}
         for build in config["builds"] if args.target in build["targets"]
     ]
+    # A Windows-only snapshot has no archive that a Homebrew cask can install.
+    # Keep cask generation for Linux/macOS snapshots and the full release config.
+    if "-windows-" in args.target:
+        config.pop("homebrew_casks", None)
     config["dist"] = "target/release-smoke"
     output = ROOT / "target/release-smoke.yaml"
     output.parent.mkdir(parents=True, exist_ok=True)

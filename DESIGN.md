@@ -281,7 +281,8 @@ Tests must use disposable directories and deterministic local commands.
 
 Release smoke CI derives its platform matrix from `.goreleaser.yaml`, validates
 that configuration, and builds a single-target snapshot with the release builder
-and archive settings on each native runner. It checks archive contents and
+and archive settings on each native runner. Windows-only snapshots omit Homebrew
+casks, which require Linux/macOS archives. It checks archive contents and
 checksums, then runs the extracted executable in a disposable directory. All
 targets cover startup, completions, scaffolding, and validation; Linux/macOS also
 cover execution, partial selection, byte fidelity, failure status, and scratch
