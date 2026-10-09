@@ -312,7 +312,7 @@ async fn broken_stdout_pipe_cancels_the_child_and_cleans_scratch() {
 #[test]
 fn shipped_local_samples_run_unattended() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    // demo.md deliberately fails; shell-override and tmpdir need optional zsh/bc.
+    // demo.md needs internet and a name; shell-override and tmpdir need optional zsh/bc.
     for sample in [
         "hello.md",
         "interactive.md",

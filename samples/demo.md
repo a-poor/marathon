@@ -1,99 +1,23 @@
 ---
 title: Hello, Marathon
-description: Run shell cells, collect answers, and search an ordinary Markdown document.
-env:
-  GREETING: "Hello"
-  WHO: "world"
 ---
 
-# Hello, Marathon
-
-This is an ordinary markdown file. Open it in any editor or renderer and it reads
-fine. Open it in `marathon` and the shell blocks below become runnable cells.
-
-The values `GREETING` and `WHO` come from the frontmatter `env`, so they're
-available to every cell from the start.
+Press `r` to fetch sample JSON, choose a name, and run the next command.
 
 ```sh
-echo "$GREETING, $WHO!"
+curl -fsS --max-time 10 https://jsonplaceholder.typicode.com/todos/1
+printf '\n'
 ```
-
-Ask for a new name:
 
 ```json mrthn=input
 {
   "type": "select",
   "prompt": "Who are you?",
   "target": "NAME",
-  "options": ["Alice","Bob","Carol"]
+  "options": ["Alice", "Bob"]
 }
 ```
 
-Greet that person:
-
 ```sh
-echo "Let me think..."
-sleep 1
-echo "$GREETING, $NAME!"
+echo "Hello, $NAME!"
 ```
-
-How about a fail?
-
-```sh
-echo "Oh no!"
-echo $PWD
-exit 1
-```
-Where are we working and where is the temp dir?
-
-```sh
-echo "Here: $PWD"
-echo "Temp: $TMP_DIR"
-ls $TMP_DIR
-```
-
-## A cell you can opt out of
-
-This block is illustrative, not something to run. `skip=true` keeps marathon from
-executing it, while other markdown tools still highlight it as shell.
-
-```sh skip=true
-echo "this block is skipped — marathon won't run it"
-```
-
-## Shell over multiple lines
-
-A cell is just a normal fenced code block — it can be as long as you like.
-
-```sh
-for n in 1 2 3; do
-  echo "step $n"
-done
-echo "done"
-```
-
-What about a really really long output?
-
-
-```sh
-for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-  echo "step $n"
-done
-echo "done"
-```
-
-How was that?
-
-```sh
-echo one
-echo two >&2
-echo three
-echo four >&2
-echo five
-echo six >&2
-echo seven
-echo eight >&2
-echo nine
-echo ten >&2
-```
-

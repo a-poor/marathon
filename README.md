@@ -417,5 +417,7 @@ cargo build --locked
 PATH="$PWD/target/debug:$PATH" vhs demo.tape
 ```
 
-The tape writes `assets/demo.gif` and demonstrates run-remaining, input selection,
-failure handling, and search. Review the recording after changing the TUI or sample.
+The tape writes `assets/demo.gif` and demonstrates a JSONPlaceholder request with
+`curl`, input selection, and the chosen name passed to the next command in a short,
+successful run. Recording requires `curl` and internet access.
+Review the recording after changing the TUI or sample.
