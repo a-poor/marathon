@@ -484,8 +484,8 @@ fn box_bottom(width: usize, border: Style) -> Line<'static> {
     Line::from(Span::styled(format!("└{mid}┘"), border))
 }
 
-/// Truncate or pad a row of spans to exactly `n` display columns (ASCII/box glyphs
-/// are width 1), so each boxed line lands its right border in the same column.
+/// Truncate or pad to `n` display columns without splitting grapheme clusters, so
+/// Unicode titles/paths/env values leave the right border in the same column.
 fn fit_to(spans: Vec<Span<'static>>, n: usize) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut used = 0usize;
@@ -493,15 +493,22 @@ fn fit_to(spans: Vec<Span<'static>>, n: usize) -> Vec<Span<'static>> {
         if used >= n {
             break;
         }
-        let w = s.content.chars().count();
+        let w = s.width();
         if used + w <= n {
             used += w;
             out.push(s);
         } else {
-            let take = n - used;
-            let truncated: String = s.content.chars().take(take).collect();
+            let mut truncated = String::new();
+            for grapheme in s.styled_graphemes(Style::default()) {
+                let width = Span::raw(grapheme.symbol).width();
+                if used + width > n {
+                    break;
+                }
+                truncated.push_str(grapheme.symbol);
+                used += width;
+            }
             out.push(Span::styled(truncated, s.style));
-            used = n;
+            break;
         }
     }
     if used < n {
@@ -1010,6 +1017,29 @@ rendered into a narrow viewport, instead of being truncated at the edge.\n\n\
         term.draw(|f| f.render_stateful_widget(DocumentView::new(&book, 1), f.area(), &mut state))
             .unwrap();
         assert!(format!("{:?}", term.backend().buffer()).contains("needle"));
+    }
+
+    #[test]
+    fn unicode_header_borders_align_without_splitting_graphemes() {
+        let book = Runbook::new(
+            Some("界/👩‍💻/book.md"),
+            "---\ntitle: cafe\u{301} 界 👩‍💻\ndescription: 界界界界界界界界界界\n---\n",
+        )
+        .unwrap();
+        for width in 13..=80 {
+            for line in header_lines(&book, width) {
+                assert_eq!(line.width(), width, "width {width}: {line:?}");
+            }
+        }
+        let text = header_lines(&book, 80)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("cafe\u{301} 界 👩‍💻"));
+        // A wide grapheme that doesn't fit is padded, not split or skipped.
+        let spans = fit_to(vec![Span::raw("a👩‍💻b")], 2);
+        assert_eq!(line_text(&Line::from(spans)), "a ");
     }
 
     #[test]

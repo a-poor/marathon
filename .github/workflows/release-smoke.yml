@@ -78,6 +78,21 @@ jobs:
           args: release --snapshot --clean --skip=before --config target/release-smoke.yaml
       - name: Test the packaged executable
         run: python scripts/release-smoke.py target/release-smoke
+      - name: Install terminal smoke-test dependency
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if ! command -v tmux >/dev/null; then
+            if [ "$RUNNER_OS" = macOS ]; then
+              brew install tmux
+            else
+              sudo apt-get update
+              sudo apt-get install -y tmux
+            fi
+          fi
+      - name: Test the packaged TUI in an isolated terminal
+        if: runner.os != 'Windows'
+        run: python scripts/tui-smoke.py target/release-smoke
       - name: Test Homebrew installation and removal
         if: runner.os == 'macOS'
         run: python scripts/homebrew-smoke.py target/release-smoke

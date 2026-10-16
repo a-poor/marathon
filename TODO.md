@@ -8,10 +8,83 @@ Keep runbooks ordinary Markdown and update the README, design, samples, and
 bundled authoring skill when behavior changes.
 Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 
+## Proposed next-release bar
+
+- Target supported shell execution on macOS and Linux; native Windows execution
+  is deferred. Existing Windows packaging checks do not imply execution support.
+- Run the existing formatting, Clippy, all-target tests, MSRV, and release archive
+  checks against the release candidate. Include the macOS Homebrew install path.
+- Run the packaged TUI smoke tests for input errors/recovery, prerequisites,
+  concurrent manual runs, run-remaining, cancellation/quit, search, output paging,
+  and resize/narrow-terminal behavior. Manually check visual theme/contrast and
+  system clipboard behavior on supported desktop environments.
+- Profile representative large runbooks and sustained output; fix observed
+  responsiveness or resource-growth problems before adding layout complexity.
+- Prioritize regression coverage for cleanup, parsing/display edge cases, and
+  actionable diagnostics. Keep documented limitations explicit; broader rendering
+  and navigation features need not block a solid release.
+- Decide whether managed background services belong in this release after defining
+  their lifecycle contract below; they are not implemented today.
+
+### Local release verification (2026-10-16)
+
+- macOS ARM64: formatting, Clippy, Rust 1.88 compatibility, and all-target tests
+  checked; native snapshot archive/CLI checks and isolated-terminal TUI checks run.
+  Unicode header alignment now uses terminal widths and preserves grapheme clusters,
+  with regression coverage for wide characters, combining accents, and emoji.
+- Homebrew's local quarantine/hook-order check passed. Full install/uninstall and
+  the other release targets still need the hosted release-smoke matrix. The local
+  GoReleaser is 2.18.3; CI remains pinned to 2.18.2. Homebrew emits a nonfatal
+  deprecation warning for the generated `preflight` hook; track generator support
+  for `preflight_steps` when updating release tooling.
+- Initial coarse profile: 5,000 cells opened in ~0.75 s, using ~205 MiB resident
+  memory; search took ~81 ms including automation overhead. Capturing 32 MiB took
+  ~3.1–3.3 s, with sampled RSS growth of ~0.8 MiB in a small document and ~2.3 MiB
+  alongside 1,000 cells. These are local observations, not performance guarantees.
+- Remaining acceptance: supported-target CI, full disposable Homebrew installation,
+  visual theme/contrast, and source/output clipboard checks in desktop terminals.
+
+## Managed background services — proposed
+
+- Support starting a long-lived command in one cell, continuing subsequent tasks,
+  and stopping it explicitly later or manually from the TUI.
+- Initial scope: CLI `exec` with an opt-in shell-fence modifier, tentatively
+  `exec=background`. Start the cell without waiting for completion, continue the
+  selected run, and retain ownership of its process group until that run ends.
+  The command can stay in the foreground inside the cell; shell `&` is unnecessary.
+  Prefer this name over `cleanup=defer`, which describes cleanup timing but does
+  not clearly express nonblocking execution. Syntax remains proposed.
+- Defer process-group cleanup for these cells even if their interpreter exits;
+  preserve ownership of remaining descendants until end-of-run cleanup. Ordinary
+  foreground cells retain their existing immediate descendant-cleanup behavior.
+- At normal completion (including a partial run's selected endpoint), stop all
+  retained background process groups and await cleanup before returning. Do the
+  same on failure, declined execution, broken output pipes, or interruption, before
+  releasing scratch space. A separate stop/control cell can follow later.
+- Starting a background cell does not imply service readiness. Initially, a later
+  ordinary shell cell can perform a bounded readiness poll. Define how `needs`
+  interacts with background cells rather than treating spawn as successful completion.
+- Before implementation, settle background exit/failure propagation, concurrent
+  CLI output ordering/interleaving and draining, and graceful-stop escalation.
+- Current manual TUI runs can overlap, but `exec` and run-remaining wait for each
+  command to finish. `needs` requires successful completion, not service readiness.
+  Shell-backgrounded descendants are terminated when their cell's shell exits.
+- Follow-up: design a structured stop/control cell referencing a stable cell ID,
+  analogous to input cells, and integrate background execution with TUI sequencing.
+  Keep it ordinary Markdown and preserve existing foreground behavior.
+- Define readiness versus merely spawned, bounded readiness waits, dependencies,
+  unexpected service exits, and how failures stop dependent/sequential work.
+- Retain owned processes and bounded output capture while later cells execute.
+  Define intentional-stop success, graceful stop/forced-kill escalation, repeated
+  starts/stops, and active-service reset/rerun guards.
+- Clean up all owned services on normal run completion, failure, interruption,
+  and quit before releasing scratch space. Define partial-run behavior when a
+  service's start or stop cell is omitted; do not silently replay omitted starts.
+- Cover CLI and TUI lifecycle behavior with local disposable-server tests, including
+  readiness failure, early exit, cancellation, and descendant cleanup.
+
 ## Reliability and portability
 
-- Implement native Windows interpreter discovery and process-tree cleanup (for
-  example, Job Objects). Current process-group guarantees apply to Unix only.
 - Fuzz/property-test Markdown parsing and ANSI sanitization; add golden command
   output fixtures and more Unicode/narrow-terminal cases.
 - Consider optional shell-syntax and interpreter-availability preflight checks;
@@ -37,6 +110,9 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 
 ## Deliberately deferred
 
+- Native Windows execution support, including interpreter discovery and process-tree
+  cleanup (for example, Job Objects). Current process-group guarantees apply to
+  Unix only; Windows support is not a next-release requirement.
 - PTY support and command input forwarding. Keep cell execution noninteractive for
   now to preserve a simple, predictable runner. Runbooks should use input cells,
   environment values, files, and commands' unattended flags. This does not remove
@@ -59,6 +135,13 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 
 ## Implemented
 
+- Packaged TUI smoke tests through an isolated tmux server on Linux/macOS, covering
+  input error/reload, sequential failure/retry, retained answers/results,
+  prerequisite guards, concurrent manual runs, process-group cancellation, quit
+  cleanup, output paging, Unicode search, help, and narrow-terminal resizing.
+  A separate optional profile script measures large-document startup/search and
+  sampled resident memory during sustained output; clipboard/visual acceptance
+  remains manual.
 - GitHub Actions CI for formatting on stable Rust, plus Clippy, all-target tests
   (including CLI execution and process cleanup), and Rust 1.88.0 compatibility
   checks on Linux and macOS.

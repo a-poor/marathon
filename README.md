@@ -371,8 +371,13 @@ verify that the download is quarantined and the install hook clears quarantine
 before completion generation, run the installed executable, verify shell
 completions, and uninstall it. Hook ordering is checked independently of whether
 Gatekeeper is enabled on the runner.
+Linux/macOS also exercise the packaged TUI in an isolated tmux server: input
+error/recovery, sequential retry, concurrent manual runs, prerequisites,
+cancellation and quit cleanup, output paging, Unicode search, and terminal resize.
+The test ignores personal tmux configuration and does not write the clipboard.
 Windows checks do not imply native shell execution support. These checks do not
-publish releases, update the Homebrew tap, or automate the interactive TUI.
+publish releases or update the Homebrew tap. Visual theme/contrast and system
+clipboard behavior still need manual acceptance checks.
 
 Run the same checks locally:
 
@@ -420,6 +425,20 @@ binary without changing your Homebrew installation:
 ```sh
 python scripts/homebrew-smoke.py target/release-smoke --quarantine-only
 ```
+
+With `tmux` installed, exercise the native packaged TUI locally:
+
+```sh
+python scripts/tui-smoke.py target/release-smoke
+python scripts/tui-profile.py target/release-smoke
+```
+
+The optional profile probe reports startup/search latency for 100, 1,000, and
+5,000-cell documents, plus sampled resident memory while capturing 32 MiB of
+output with and without a 1,000-cell document. It uses disposable local runbooks
+and Unix `ps`; timings include terminal automation overhead and are diagnostic
+measurements, not stable benchmark thresholds. Temporary captures are removed
+when each TUI exits.
 
 To refresh the README demo, install [VHS](https://github.com/charmbracelet/vhs), then
 record the current local build from the repository root:
