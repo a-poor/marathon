@@ -279,6 +279,13 @@ partial output, duplicate starts, reset/quit, output backpressure, failed writes
 signals, confirmation, input defaults/validation, exit codes, and scratch cleanup.
 Tests must use disposable directories and deterministic local commands.
 
+Parsing and output capture have separate coverage-guided targets in `fuzz/`, with
+bounded weekly/manual campaigns. Fixed-seed output properties run in ordinary CI,
+including chunk invariance, raw-byte preservation, and multi-page UTF-8 boundaries.
+Both workspaces use `vendor/markdown`, a local copy of markdown-rs 1.0.0 with a
+setext-heading resolver fix discovered by fuzzing; provenance and removal criteria
+are recorded in `vendor/markdown/PATCHES.md`.
+
 Release smoke CI derives its platform matrix from `.goreleaser.yaml`, validates
 that configuration, and builds a single-target snapshot with the release builder
 and archive settings on each native runner. Windows-only snapshots omit Homebrew

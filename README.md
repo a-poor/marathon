@@ -388,6 +388,51 @@ cargo fmt --all -- --check
 cargo +1.88.0 check --all-targets --locked
 ```
 
+### Fuzzing and output properties
+
+The regular test suite includes a fixed-seed generative test of arbitrary bytes
+and terminal sequences. It checks that whole-buffer, bytewise, and variable-sized
+chunks produce identical cleaned output, preserve raw bytes, and yield bounded,
+valid UTF-8 output pages. No extra test dependency or nightly compiler is needed.
+Multi-page cases also place two-, three-, and four-byte UTF-8 characters across
+page boundaries and check that the pages reconstruct the complete output.
+
+Two `cargo-fuzz` targets extend this coverage:
+
+- `runbook`: Markdown/frontmatter/fence/input parsing; malformed input may return
+  an error, but must not panic. It never executes cells or reads option files.
+- `output`: the streaming capture properties above, plus diagnostic sanitizer
+  control-byte removal and idempotence. Captures use disposable temporary files.
+
+Install nightly Rust and `cargo-fuzz`, then run bounded local campaigns:
+
+```sh
+rustup toolchain install nightly
+cargo install cargo-fuzz --version 0.13.2 --locked
+mkdir -p fuzz/corpus/runbook fuzz/corpus/output
+cp fuzz/seeds/runbook/* fuzz/corpus/runbook/
+cp fuzz/seeds/output/* fuzz/corpus/output/
+cargo +nightly fuzz run runbook -- -max_total_time=60 -timeout=10 -max_len=8192 -dict=fuzz/runbook.dict
+cargo +nightly fuzz run output -- -max_total_time=60 -timeout=10 -max_len=1024 -dict=fuzz/output.dict
+```
+
+The separate `fuzz/` workspace has its own lockfile, initialized from the application's
+locked dependencies; keep shared versions aligned when updating dependencies.
+Both workspaces use the patched local Markdown parser in `vendor/markdown`; see
+[patch provenance and removal criteria](vendor/markdown/PATCHES.md).
+Generated corpora, binaries, and crash artifacts are ignored; curated seeds and
+dictionaries are checked in. Reproduce a failure with
+`cargo +nightly fuzz run TARGET fuzz/artifacts/TARGET/crash-HASH`, minimize it with
+`cargo +nightly fuzz tmin TARGET fuzz/artifacts/TARGET/crash-HASH`, and add a small
+regression test before fixing it. A bounded campaign is a bug-finding exercise,
+not proof that all inputs are safe.
+
+[Fuzz smoke CI](.github/workflows/fuzz.yml) runs weekly or on manual dispatch, with
+two-minute campaigns, reusable corpora, and uploaded failure artifacts. Ordinary
+push/PR CI runs the deterministic properties and checks fuzz-target formatting.
+
+### Native release smoke tests
+
 To smoke-test a native release archive locally, install GoReleaser v2.18.2 and use a
 Python virtual environment for the release tools. From the repository root:
 

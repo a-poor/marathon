@@ -1,0 +1,17 @@
+---
+title: Fuzz seed
+env:
+  REGION: east
+---
+
+```sh id=prepare
+printf 'ready\n'
+```
+
+```json mrthn=input id=choice needs=prepare
+{"type":"select","prompt":"Region?","target":"REGION","options":["east","west"],"default":"east"}
+```
+
+```sh needs=choice
+printf '%s\n' "$REGION"
+```

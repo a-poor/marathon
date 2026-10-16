@@ -1,0 +1,19 @@
+[package]
+name = "markdown"
+version = "1.0.0"
+edition = "2018"
+rust-version = "1.56"
+license = "MIT"
+description = "CommonMark compliant markdown parser in Rust with ASTs and extensions"
+repository = "https://github.com/wooorm/markdown-rs"
+
+[dependencies]
+log = { optional = true, version = "0.4" }
+serde = { features = ["derive"], optional = true, version = "1" }
+unicode-id = { features = ["no_std"], version = "0.3" }
+
+[features]
+default = []
+json = ["serde"]
+log = ["dep:log"]
+serde = ["dep:serde"]

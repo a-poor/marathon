@@ -1,0 +1,59 @@
+name: Fuzz smoke tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: runbook
+            max_len: 8192
+          - target: output
+            max_len: 1024
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: fuzz-${{ matrix.target }}
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Seed the corpus
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          cp fuzz/seeds/${{ matrix.target }}/* fuzz/corpus/${{ matrix.target }}/
+      - name: Verify fuzz dependency lock
+        run: cargo +nightly metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 --no-deps > /dev/null
+      - name: Two-minute coverage-guided campaign
+        run: >-
+          cargo +nightly fuzz run ${{ matrix.target }} --
+          -max_total_time=120 -timeout=10 -rss_limit_mb=2048
+          -max_len=${{ matrix.max_len }} -dict=fuzz/${{ matrix.target }}.dict
+      - name: Preserve failures for reproduction and minimization
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-failures-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

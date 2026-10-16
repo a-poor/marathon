@@ -1,0 +1,30 @@
+[package]
+name = "marathon-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+marathon = { path = ".." }
+
+# Keep fuzz-only tooling out of the normal build and MSRV dependency graph.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "runbook"
+path = "fuzz_targets/runbook.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "output"
+path = "fuzz_targets/output.rs"
+test = false
+doc = false
+bench = false

@@ -41,6 +41,17 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
   memory; search took ~81 ms including automation overhead. Capturing 32 MiB took
   ~3.1–3.3 s, with sampled RSS growth of ~0.8 MiB in a small document and ~2.3 MiB
   alongside 1,000 cells. These are local observations, not performance guarantees.
+- Initial output fuzz campaign completed 51,814 cases in 61 seconds with no failure.
+  Parsing fuzzing found a Markdown dependency panic, minimized to `---\n\n>`.
+  Frontmatter parsing is now enabled only with matching delimiters; unclosed
+  candidates remain ordinary Markdown. Unit and CLI regression tests cover this.
+- Follow-up fuzzing found a second Markdown dependency panic, minimized to
+  `:\n -\n--\nt\n-`. A local markdown-rs 1.0.0 patch fixes a stale paragraph
+  event in setext-heading resolution; see `vendor/markdown/PATCHES.md`. All saved
+  parser crash cases replay successfully. The patched parser completed 426,188
+  runs in 121 seconds; output completed 52,547 runs in 61 seconds without failure.
+  All 190 regular tests, formatting, Clippy, and Rust 1.88 checks passed. Output
+  properties now also cover UTF-8 characters crossing multiple page boundaries.
 - Remaining acceptance: supported-target CI, full disposable Homebrew installation,
   visual theme/contrast, and source/output clipboard checks in desktop terminals.
 
@@ -85,8 +96,8 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 
 ## Reliability and portability
 
-- Fuzz/property-test Markdown parsing and ANSI sanitization; add golden command
-  output fixtures and more Unicode/narrow-terminal cases.
+- Extend the bounded parsing/output fuzz campaigns and curated regression corpus;
+  add golden command output fixtures and more Unicode/narrow-terminal cases.
 - Consider optional shell-syntax and interpreter-availability preflight checks;
   current `validate` only checks Markdown/configuration/input structure.
 
@@ -110,6 +121,8 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 
 ## Deliberately deferred
 
+- Formal microbenchmark baselines and mutation-testing campaigns. Current release
+  work uses coarse terminal performance probes plus targeted fuzz/property tests.
 - Native Windows execution support, including interpreter discovery and process-tree
   cleanup (for example, Job Objects). Current process-group guarantees apply to
   Unix only; Windows support is not a next-release requirement.
@@ -135,6 +148,10 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 
 ## Implemented
 
+- Coverage-guided fuzz targets for runbook parsing and output sanitization/capture,
+  with curated seeds/dictionaries and bounded weekly/manual CI campaigns. A shared
+  fixed-seed generative test runs in ordinary CI and verifies chunk-boundary
+  invariance, raw-byte preservation, and bounded UTF-8 page reconstruction.
 - Packaged TUI smoke tests through an isolated tmux server on Linux/macOS, covering
   input error/reload, sequential failure/retry, retained answers/results,
   prerequisite guards, concurrent manual runs, process-group cancellation, quit

@@ -13,6 +13,20 @@ fn validate(doc: &str) -> Output {
 }
 
 #[test]
+fn unclosed_frontmatter_before_a_blockquote_does_not_crash() {
+    let output = validate("---\n\n>");
+    assert!(output.status.success(), "{output:?}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+}
+
+#[test]
+fn successive_setext_headings_do_not_crash() {
+    let output = validate(":\n -\n--\nt\n-");
+    assert!(output.status.success(), "{output:?}");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+}
+
+#[test]
 fn invalid_input_targets_and_defaults_report_source_and_cell() {
     let cases = [
         (
