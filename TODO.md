@@ -93,15 +93,23 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
   including version/tag alignment, the macOS build-host requirement, cross-repo
   publishing credentials, and post-publication checks.
 - Selected 0.5.0 for the next release and updated Cargo.toml/Cargo.lock; the latest
-  published release is 0.4.0. Hosted CI must check the final release commit.
+  published release is 0.4.0. On candidate `31f62db`,
+  [CI](https://github.com/a-poor/marathon/actions/runs/38956620592) and the full
+  [release-smoke matrix](https://github.com/a-poor/marathon/actions/runs/38956620628)
+  passed, including both macOS Homebrew install/uninstall jobs.
   No publishing workflow exists; publishing is manual.
 - After the version bump, `cargo run --locked -- --version` reported 0.5.0.
   Rebuilt the native macOS ARM64 snapshot: archive/CLI, packaged TUI, and Homebrew
   quarantine-hook checks passed. Snapshot metadata still derives from the latest
   Git tag (0.4.0); final release metadata requires the approved v0.5.0 tag.
-- Desktop visual/source-copy/output-copy acceptance is still pending on macOS
-  and Linux. This session has no desktop-control tools; automated tests do not
-  substitute for those checks. Record terminal/theme details with the results.
+- macOS / Ghostty manual acceptance: user-provided source copy matches the first
+  output-spooling cell; pasted output includes records 00001 through 10000.
+  The second cell's copied output correctly shows `done` and `€` without escape
+  sequences. The supplied dark-theme screenshot shows readable text and intact
+  layout; the user also confirmed input editing looks great.
+- Additional theme testing is deferred at the user's request, not marked passed.
+  Linux desktop visual/clipboard acceptance remains unverified. The user approved
+  publishing 0.5.0 with these checks deferred.
 - Suggested release-note topics since v0.4.0: Comrak parser migration and parser
   crash regressions, MSRV raised to 1.89, Homebrew quarantine/completion ordering,
   and expanded packaged TUI/fuzz/cross-platform release verification.

@@ -357,6 +357,8 @@ implementation contracts, and [TODO.md](TODO.md) for remaining work.
 
 ## Development
 
+See [CHANGELOG.md](CHANGELOG.md) for release changes.
+
 [CI](.github/workflows/ci.yml) runs on pushes and pull requests, and can also be
 started manually. It checks formatting on stable Rust and runs Clippy, the full
 test suite (including CLI execution and process cleanup), and the Rust 1.89.0
