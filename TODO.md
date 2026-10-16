@@ -113,8 +113,15 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 - Suggested release-note topics since v0.4.0: Comrak parser migration and parser
   crash regressions, MSRV raised to 1.89, Homebrew quarantine/completion ordering,
   and expanded packaged TUI/fuzz/cross-platform release verification.
-- Publishing credentials and final release download/install paths remain to be
-  verified during publication. Managed background services remain proposed.
+- Published v0.5.0 from `565acba`; all five downloaded archive checksums verified,
+  the published macOS ARM64 binary passed CLI/execution smoke tests, and the
+  Homebrew tap was updated. Final hosted release-smoke run
+  [38958414231](https://github.com/a-poor/marathon/actions/runs/38958414231) passed.
+- User confirmed the published Homebrew upgrade worked with
+  `brew upgrade --cask a-poor/tap/marathon`. The unqualified
+  `brew upgrade --cask marathon` reportedly selected a different package showing
+  version `20260930`; the README now documents the fully qualified upgrade command.
+  Managed background services remain proposed.
 
 ## Managed background services — proposed
 

@@ -14,6 +14,16 @@ On macOS, use Homebrew:
 brew install a-poor/tap/marathon
 ```
 
+To upgrade an existing installation, use the fully qualified cask name:
+
+```sh
+brew update
+brew upgrade --cask a-poor/tap/marathon
+```
+
+Avoid `brew upgrade --cask marathon`: the unqualified name can resolve to a
+different package. Verify the installed version with `marathon --version`.
+
 Or build from source with Rust 1.89 or newer:
 
 ```sh
