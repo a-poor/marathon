@@ -3,3 +3,4 @@
 dist/
 .intentionally-empty-file.o
 target/
+**/__pycache__/
