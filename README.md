@@ -21,8 +21,9 @@ cargo install --git https://github.com/a-poor/marathon
 ```
 
 Precompiled binaries are available on the [releases page](https://github.com/a-poor/marathon/releases).
-Execution currently assumes a POSIX shell environment; process-group cancellation
-is supported on macOS and Linux. Native Windows process-tree cleanup is not yet implemented.
+Shell execution is supported on macOS and Linux and assumes a POSIX shell
+environment. Windows archives receive startup and packaging checks only; native
+Windows execution and process-tree cleanup are not supported in this release.
 
 ## Quick start
 
@@ -387,6 +388,61 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 cargo +1.89.0 check --all-targets --locked
 ```
+
+### Release acceptance and publishing
+
+Releases are published manually from a macOS build host; the CI workflows only
+verify snapshots. Use the full `.goreleaser.yaml` for publishing, not the generated
+single-target `target/release-smoke.yaml`.
+
+Before choosing the final release commit:
+
+1. Update the package version in `Cargo.toml` and its entry in `Cargo.lock` to the
+   agreed release version. Check that `marathon --version` matches the intended tag
+   (without its `v` prefix); GoReleaser's tag does not replace Cargo's package version.
+2. Run the local development checks above and require successful CI and the full
+   release-smoke matrix for that commit, including both macOS Homebrew installs.
+3. Complete desktop acceptance below on macOS and Linux. Record the commit,
+   OS, terminal/version, light/dark theme, and results in `TODO.md`.
+4. Prepare release notes covering changes since the previous tag, the minimum Rust
+   version, supported platforms, and known limitations. Managed background services
+   remain proposed; commands requiring interactive stdin/PTYs are unsupported.
+
+Desktop acceptance uses the extracted native snapshot executable, rather than an
+older executable on `PATH`:
+
+- Open `samples/interactive.md` and `samples/execution-controls.md`. Check readable
+  headings, selection, input editors, errors, and running/success/failure status
+  in both light and dark terminal themes. Check help and a narrow window too.
+- With `samples/output-spooling.md`, check Unicode, expanded output, and paging.
+  Select a shell cell, press `y`, and paste into a plain-text desktop editor;
+  compare with the fence body, including newlines and Unicode.
+- Run that cell, reselect it, press `Y`, and paste into the editor. Confirm the
+  complete cleaned output is copied, not just the visible tail or page, and that
+  terminal escape sequences are absent. These checks replace the system clipboard.
+
+For publishing, provision GoReleaser v2.18.2, stable Rust with all five configured
+targets, Apple's command-line tools, and the Python build tools listed under
+native release smoke tests below. Set `CARGO_ZIGBUILD_PYTHON_PATH` to that Python.
+Use a `GITHUB_TOKEN` with contents-write access to both `a-poor/marathon` and
+`a-poor/homebrew-tap`; a workflow's repository-scoped token alone cannot update the
+separate tap. Keep credentials out of files and command history.
+
+After the release commit and matching `v<version>` tag have been explicitly
+approved, committed, and pushed, run from a clean checkout of that tag:
+
+```sh
+goreleaser check
+goreleaser release --skip=before
+```
+
+The installation hooks are skipped because the pinned tools are already
+provisioned. GoReleaser writes to `dist/`; move aside any previous artifacts before
+running. This command publishes the GitHub release, archives/checksums, and
+Homebrew cask update. Check the published assets and checksums, binary version,
+and tap commit, then verify installation from the published cask on a disposable
+macOS environment. Snapshot success does not verify publishing credentials or
+the final download URLs.
 
 ### Fuzzing and output properties
 

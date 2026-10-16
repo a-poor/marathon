@@ -52,8 +52,9 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
   runs in 121 seconds; output completed 52,547 runs in 61 seconds without failure.
   All 190 regular tests, formatting, Clippy, and Rust 1.88 checks passed. Output
   properties now also cover UTF-8 characters crossing multiple page boundaries.
-- Remaining acceptance: supported-target CI, full disposable Homebrew installation,
-  visual theme/contrast, and source/output clipboard checks in desktop terminals.
+- At this checkpoint, supported-target CI, full disposable Homebrew installation,
+  visual theme/contrast, and desktop clipboard checks remained open. The hosted
+  CI/Homebrew checks subsequently passed; see post-migration verification below.
 
 ### Post-migration release verification (2026-10-16, `3454c40`)
 
@@ -82,6 +83,30 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 - Desktop visual contrast and real clipboard checks remain open: the desktop
   automation tool denied access to Ghostty. Automated resize, Unicode search,
   output paging, and parser source-copy regression checks passed.
+
+### Release-preparation audit (2026-10-16)
+
+- Rechecked `1a4f8aa` locally: all 194 tests, formatting, Clippy, and Rust 1.89
+  all-target checks passed. GoReleaser configuration validation passed with local
+  2.18.3; release CI is pinned to 2.18.2.
+- Added desktop acceptance and manual publishing instructions to the README,
+  including version/tag alignment, the macOS build-host requirement, cross-repo
+  publishing credentials, and post-publication checks.
+- Selected 0.5.0 for the next release and updated Cargo.toml/Cargo.lock; the latest
+  published release is 0.4.0. Hosted CI must check the final release commit.
+  No publishing workflow exists; publishing is manual.
+- After the version bump, `cargo run --locked -- --version` reported 0.5.0.
+  Rebuilt the native macOS ARM64 snapshot: archive/CLI, packaged TUI, and Homebrew
+  quarantine-hook checks passed. Snapshot metadata still derives from the latest
+  Git tag (0.4.0); final release metadata requires the approved v0.5.0 tag.
+- Desktop visual/source-copy/output-copy acceptance is still pending on macOS
+  and Linux. This session has no desktop-control tools; automated tests do not
+  substitute for those checks. Record terminal/theme details with the results.
+- Suggested release-note topics since v0.4.0: Comrak parser migration and parser
+  crash regressions, MSRV raised to 1.89, Homebrew quarantine/completion ordering,
+  and expanded packaged TUI/fuzz/cross-platform release verification.
+- Publishing credentials and final release download/install paths remain to be
+  verified during publication. Managed background services remain proposed.
 
 ## Managed background services — proposed
 
