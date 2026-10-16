@@ -9,6 +9,7 @@ import runpy
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -35,11 +36,25 @@ class Tui:
         work.mkdir()
         (work / "book.md").write_text(book, encoding="utf-8")
         self.socket = str(work / "tmux.sock")
+        # Own/reap Marathon through a tiny supervisor. Ubuntu's tmux can leave
+        # an exited pane process as a zombie without publishing its status.
+        # The supervisor records the actual child PID and wait() result, so we
+        # still require a clean application exit rather than trusting PTY EOF.
+        supervisor = work / "supervisor.py"
+        supervisor.write_text(
+            "import pathlib, subprocess, sys\n"
+            "child = subprocess.Popen(sys.argv[1:])\n"
+            "pathlib.Path('app.pid').write_text(str(child.pid))\n"
+            "status = child.wait()\n"
+            "pathlib.Path('app.exit.tmp').write_text(str(status))\n"
+            "pathlib.Path('app.exit.tmp').replace('app.exit')\n",
+            encoding="utf-8",
+        )
         # Ignore personal tmux configuration and never use the user's server.
         self.tmux("new-session", "-d", "-x", "120", "-y", "40", "-c", str(work),
-                  str(binary), "run", "book.md")
+                  sys.executable, str(supervisor), str(binary), "run", "book.md")
         self.tmux("set-option", "remain-on-exit", "on")
-        self.pid = int(self.tmux("display-message", "-p", "#{pane_pid}"))
+        self.pid = int(self.file("app.pid"))
         try:
             self.wait(lambda: "ready" in self.screen(), "initial frame")
         except Exception:
@@ -79,18 +94,14 @@ class Tui:
 
     def quit(self):
         self.keys("C-c")
-        # PTY EOF can precede child reaping. pane_dead alone does not guarantee
-        # that tmux has collected an exit status yet (observed on Linux ARM64).
         self.wait(lambda: self.exit_result() is not None, "TUI exit status")
-        status, signal = self.exit_result()
-        require(status == "0" and not signal,
-                f"TUI failed on exit: status={status!r}, signal={signal!r}\n{self.screen()}")
+        status = self.exit_result()
+        require(status == 0,
+                f"TUI failed on exit: returncode={status} (negative means signal)\n{self.screen()}")
 
     def exit_result(self):
-        dead, status, signal = self.tmux(
-            "display-message", "-p", "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}"
-        ).strip().split("|")
-        return (status, signal) if dead == "1" and (status or signal) else None
+        path = self.work / "app.exit"
+        return int(path.read_text()) if path.exists() else None
 
     def close(self):
         try:

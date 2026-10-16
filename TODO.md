@@ -68,11 +68,14 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 - Pushed `3454c40` to `main`; hosted verification is tracked by
   [CI](https://github.com/a-poor/marathon/actions/runs/38940385560) and
   [release smoke](https://github.com/a-poor/marathon/actions/runs/38940385403).
-  Regular CI passed. The Linux ARM64 TUI job exposed a possible tmux exit-status
-  race: the harness checked `pane_dead` before requiring a collected status.
-  The harness now waits for status/signal and reports both on failure, with
-  unconditional server cleanup. Local packaged TUI tests passed; hosted
-  confirmation is pending.
+  Regular CI passed. Both Linux TUI jobs subsequently timed out on exit even
+  after waiting for tmux status. Reproduction on Ubuntu 24.04 showed Marathon
+  already exited as a zombie that tmux had not reaped. The test launcher now
+  directly owns/reaps Marathon and records its actual PID and exit code through
+  a Python supervisor, retaining zero-exit and descendant-cleanup requirements.
+  Thirty full Ubuntu smoke-suite repetitions and the local packaged macOS suite
+  passed with this launcher. Hosted confirmation is pending; both macOS archive/
+  Homebrew jobs and Windows packaging passed in the preceding run.
 - Desktop visual contrast and real clipboard checks remain open: the desktop
   automation tool denied access to Ghostty. Automated resize, Unicode search,
   output paging, and parser source-copy regression checks passed.
