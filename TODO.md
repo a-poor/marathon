@@ -74,8 +74,11 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
   directly owns/reaps Marathon and records its actual PID and exit code through
   a Python supervisor, retaining zero-exit and descendant-cleanup requirements.
   Thirty full Ubuntu smoke-suite repetitions and the local packaged macOS suite
-  passed with this launcher. Hosted confirmation is pending; both macOS archive/
-  Homebrew jobs and Windows packaging passed in the preceding run.
+  passed with this launcher. On `4face87`,
+  [CI](https://github.com/a-poor/marathon/actions/runs/38942389641) and the complete
+  [release matrix](https://github.com/a-poor/marathon/actions/runs/38942389574)
+  passed: both Linux architectures, both macOS architectures (including Homebrew
+  install/uninstall), and Windows archive/startup checks.
 - Desktop visual contrast and real clipboard checks remain open: the desktop
   automation tool denied access to Ghostty. Automated resize, Unicode search,
   output paging, and parser source-copy regression checks passed.
