@@ -79,16 +79,27 @@ class Tui:
 
     def quit(self):
         self.keys("C-c")
-        self.wait(lambda: self.tmux("display-message", "-p", "#{pane_dead}").strip() == "1",
-                  "clean TUI exit")
-        require(self.tmux("display-message", "-p", "#{pane_dead_status}").strip() == "0",
-                f"TUI failed on exit\n{self.screen()}")
+        # PTY EOF can precede child reaping. pane_dead alone does not guarantee
+        # that tmux has collected an exit status yet (observed on Linux ARM64).
+        self.wait(lambda: self.exit_result() is not None, "TUI exit status")
+        status, signal = self.exit_result()
+        require(status == "0" and not signal,
+                f"TUI failed on exit: status={status!r}, signal={signal!r}\n{self.screen()}")
+
+    def exit_result(self):
+        dead, status, signal = self.tmux(
+            "display-message", "-p", "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}"
+        ).strip().split("|")
+        return (status, signal) if dead == "1" and (status or signal) else None
 
     def close(self):
-        if alive(self.pid):
-            os.kill(self.pid, signal.SIGTERM)
-            self.wait(lambda: not alive(self.pid), "shutdown after test")
-        self.tmux("kill-server")
+        try:
+            if self.exit_result() is None and alive(self.pid):
+                os.kill(self.pid, signal.SIGTERM)
+                self.wait(lambda: self.exit_result() is not None or not alive(self.pid),
+                          "shutdown after test")
+        finally:
+            self.tmux("kill-server")
 
 
 def recovery(binary, work):

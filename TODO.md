@@ -55,6 +55,28 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 - Remaining acceptance: supported-target CI, full disposable Homebrew installation,
   visual theme/contrast, and source/output clipboard checks in desktop terminals.
 
+### Post-migration release verification (2026-10-16, `3454c40`)
+
+- Built the native macOS ARM64 snapshot archive with local GoReleaser 2.18.3
+  (hosted CI remains pinned to 2.18.2). Archive/CLI smoke tests, isolated tmux TUI
+  tests, and Homebrew quarantine-hook ordering passed.
+- Repeated the coarse profile: 5,000 cells opened in 211 ms with 48,720 KiB RSS;
+  search took 83 ms. The earlier parser measured about 750 ms and 205 MiB.
+  These are single local observations with automation overhead, not controlled
+  benchmark results. Capturing 32 MiB took 3.21 s with no additional cells and
+  2.84 s alongside 1,000 cells; sampled RSS growth was 864 KiB and 2,576 KiB.
+- Pushed `3454c40` to `main`; hosted verification is tracked by
+  [CI](https://github.com/a-poor/marathon/actions/runs/38940385560) and
+  [release smoke](https://github.com/a-poor/marathon/actions/runs/38940385403).
+  Regular CI passed. The Linux ARM64 TUI job exposed a possible tmux exit-status
+  race: the harness checked `pane_dead` before requiring a collected status.
+  The harness now waits for status/signal and reports both on failure, with
+  unconditional server cleanup. Local packaged TUI tests passed; hosted
+  confirmation is pending.
+- Desktop visual contrast and real clipboard checks remain open: the desktop
+  automation tool denied access to Ghostty. Automated resize, Unicode search,
+  output paging, and parser source-copy regression checks passed.
+
 ## Managed background services — proposed
 
 - Support starting a long-lived command in one cell, continuing subsequent tasks,
