@@ -21,10 +21,10 @@ cargo run -- <args>
 cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
-cargo +1.88.0 check --all-targets --locked
+cargo +1.89.0 check --all-targets --locked
 ```
 
-The project uses Rust edition 2024 with MSRV 1.88.0.
+The project uses Rust edition 2024 with MSRV 1.89.0.
 
 ## Architecture
 

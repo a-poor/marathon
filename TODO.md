@@ -47,7 +47,7 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
   candidates remain ordinary Markdown. Unit and CLI regression tests cover this.
 - Follow-up fuzzing found a second Markdown dependency panic, minimized to
   `:\n -\n--\nt\n-`. A local markdown-rs 1.0.0 patch fixes a stale paragraph
-  event in setext-heading resolution; see `vendor/markdown/PATCHES.md`. All saved
+  event in setext-heading resolution (preserved in commit `eeb0432`). All saved
   parser crash cases replay successfully. The patched parser completed 426,188
   runs in 121 seconds; output completed 52,547 runs in 61 seconds without failure.
   All 190 regular tests, formatting, Clippy, and Rust 1.88 checks passed. Output
@@ -148,6 +148,12 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
 
 ## Implemented
 
+- Comrak 0.56 parser migration with an owned document model, preserving
+  frontmatter delimiters, fence metadata decoding boundaries, code-body EOLs,
+  source copying, and top-level-only execution. Removed the local markdown-rs
+  fork and raised MSRV to Rust 1.89. All 194 tests, formatting, Clippy, and MSRV
+  checks passed locally; saved parser crashes replayed successfully, and the
+  Comrak campaign completed 1,287,092 runs in 121 seconds without failure.
 - Coverage-guided fuzz targets for runbook parsing and output sanitization/capture,
   with curated seeds/dictionaries and bounded weekly/manual CI campaigns. A shared
   fixed-seed generative test runs in ordinary CI and verifies chunk-boundary
@@ -160,7 +166,7 @@ Coordinate model/API changes to `book.rs` and `tui.rs` when working in parallel.
   sampled resident memory during sustained output; clipboard/visual acceptance
   remains manual.
 - GitHub Actions CI for formatting on stable Rust, plus Clippy, all-target tests
-  (including CLI execution and process cleanup), and Rust 1.88.0 compatibility
+  (including CLI execution and process cleanup), and Rust 1.89.0 compatibility
   checks on Linux and macOS.
 - GoReleaser configuration validation and per-target snapshot archive smoke tests
   for every configured release target. Linux/macOS exercise CLI execution, partial

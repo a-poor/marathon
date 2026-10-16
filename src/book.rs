@@ -28,7 +28,7 @@ pub struct Runbook {
     tmp_guard: Option<tempfile::TempDir>,
 
     /// The original document text. Retained so a markdown block can be copied back
-    /// out as its exact source (via the `mdast` node's byte offsets).
+    /// out as its exact source (via the owned Markdown node's byte offsets).
     source: String,
 
     /// Extra environment overlaid on the frontmatter `env` for every cell — the merge
@@ -74,11 +74,11 @@ impl Runbook {
             .filter(|n| {
                 !matches!(
                     n,
-                    markdown::mdast::Node::Yaml(_) | markdown::mdast::Node::Toml(_)
+                    crate::markdown::Node::Yaml(_) | crate::markdown::Node::Toml(_)
                 )
             })
             .map(|n| match n {
-                markdown::mdast::Node::Code(c) => {
+                crate::markdown::Node::Code(c) => {
                     cell_number += 1;
                     let (line, column) = c
                         .position
@@ -326,7 +326,7 @@ impl Runbook {
     /// The text to copy for the block at `idx`, by kind:
     /// - **code** → the raw cell body (not the fenced ```` ``` ```` block);
     /// - **markdown** → its exact source, sliced from the original document via the
-    ///   `mdast` node's byte offsets;
+    ///   owned Markdown node's byte offsets;
     /// - **input** → not copyable (`None`).
     ///
     /// `None` if the index is out of range, the block is an input cell, or a markdown
@@ -441,7 +441,7 @@ impl RunCounts {
 pub enum BookBlock {
     Code(CodeBlock),
     Input(InputCell),
-    Md(markdown::mdast::Node),
+    Md(crate::markdown::Node),
 }
 
 /// Runnable markdown code block
@@ -533,10 +533,10 @@ impl CodeBlock {
     }
 }
 
-impl TryFrom<markdown::mdast::Code> for CodeBlock {
+impl TryFrom<crate::markdown::Code> for CodeBlock {
     type Error = String;
 
-    fn try_from(val: markdown::mdast::Code) -> Result<Self, Self::Error> {
+    fn try_from(val: crate::markdown::Code) -> Result<Self, Self::Error> {
         // Parse the meta fields
         let meta: CodeBlockMeta = if let Some(meta) = val.meta {
             serde_kv::from_str(&meta)

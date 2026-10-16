@@ -14,7 +14,7 @@ On macOS, use Homebrew:
 brew install a-poor/tap/marathon
 ```
 
-Or build from source with Rust 1.88 or newer:
+Or build from source with Rust 1.89 or newer:
 
 ```sh
 cargo install --git https://github.com/a-poor/marathon
@@ -358,7 +358,7 @@ implementation contracts, and [TODO.md](TODO.md) for remaining work.
 
 [CI](.github/workflows/ci.yml) runs on pushes and pull requests, and can also be
 started manually. It checks formatting on stable Rust and runs Clippy, the full
-test suite (including CLI execution and process cleanup), and the Rust 1.88.0
+test suite (including CLI execution and process cleanup), and the Rust 1.89.0
 minimum-version build check on both Linux and macOS.
 
 [Release smoke tests](.github/workflows/release-smoke.yml) validate the GoReleaser
@@ -385,7 +385,7 @@ Run the same checks locally:
 cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
-cargo +1.88.0 check --all-targets --locked
+cargo +1.89.0 check --all-targets --locked
 ```
 
 ### Fuzzing and output properties
@@ -418,8 +418,9 @@ cargo +nightly fuzz run output -- -max_total_time=60 -timeout=10 -max_len=1024 -
 
 The separate `fuzz/` workspace has its own lockfile, initialized from the application's
 locked dependencies; keep shared versions aligned when updating dependencies.
-Both workspaces use the patched local Markdown parser in `vendor/markdown`; see
-[patch provenance and removal criteria](vendor/markdown/PATCHES.md).
+Both workspaces use Comrak with its default features disabled. Marathon owns the
+parsed document model and preserves its existing frontmatter and fence metadata
+rules in the parser adapter.
 Generated corpora, binaries, and crash artifacts are ignored; curated seeds and
 dictionaries are checked in. Reproduce a failure with
 `cargo +nightly fuzz run TARGET fuzz/artifacts/TARGET/crash-HASH`, minimize it with

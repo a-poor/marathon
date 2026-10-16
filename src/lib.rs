@@ -3,6 +3,7 @@ pub mod book;
 pub mod cli;
 pub mod exec;
 pub mod execution;
+pub mod markdown;
 pub mod output;
 pub mod runner;
 pub mod scaffold;

@@ -1,4 +1,4 @@
-//! Render a markdown (`mdast`) block node into styled, width-wrapped lines.
+//! Render a markdown (owned Markdown) block node into styled, width-wrapped lines.
 //!
 //! Scope is "lean core" (see DESIGN.md / the rendering plan): headings,
 //! paragraphs, ordered/unordered lists, blockquotes, thematic breaks, and the
@@ -9,7 +9,7 @@
 //! can concatenate blocks into one scrollable document. Fenced code blocks are
 //! *not* handled here — they are separate runnable cells.
 
-use markdown::mdast::Node;
+use crate::markdown::Node;
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 
@@ -229,9 +229,8 @@ mod tests {
     use super::*;
 
     fn first_block(src: &str) -> Node {
-        let opts = markdown::ParseOptions::gfm();
-        let root = markdown::to_mdast(src, &opts).unwrap();
-        root.children().unwrap().first().unwrap().clone()
+        let root = crate::util::parse_markdown(src).unwrap();
+        root.children.first().unwrap().clone()
     }
 
     fn text(line: &Line<'static>) -> String {

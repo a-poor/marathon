@@ -12,7 +12,9 @@ A runbook is ordinary Markdown. Marathon-specific configuration uses, in order:
 2. Bare `key=value` pairs after a fence's language for per-cell settings.
 3. `json mrthn=input` blocks for structured prompts.
 
-The Markdown parser uses GFM plus frontmatter. Only top-level `sh`, `bash`, and
+The Markdown parser uses Comrak with GFM extensions. The adapter handles YAML/TOML
+frontmatter delimiters, keeps source byte offsets, and converts Comrak's arena AST
+into owned nodes for the runbook and renderer. Only top-level `sh`, `bash`, and
 `zsh` code blocks are runnable; `skip=true` disables execution. Unknown languages,
 unlabeled fences, and indented code are display-only. Nested Markdown is prose,
 not a nested execution graph. Frontmatter fields are documented in the README.
@@ -282,9 +284,9 @@ Tests must use disposable directories and deterministic local commands.
 Parsing and output capture have separate coverage-guided targets in `fuzz/`, with
 bounded weekly/manual campaigns. Fixed-seed output properties run in ordinary CI,
 including chunk invariance, raw-byte preservation, and multi-page UTF-8 boundaries.
-Both workspaces use `vendor/markdown`, a local copy of markdown-rs 1.0.0 with a
-setext-heading resolver fix discovered by fuzzing; provenance and removal criteria
-are recorded in `vendor/markdown/PATCHES.md`.
+Both workspaces use Comrak. Regression cases from the previous markdown-rs parser
+remain in the suite and corpus, alongside tests for executable-cell boundaries,
+encoded fence metadata, original code-body line endings, and Unicode source copying.
 
 Release smoke CI derives its platform matrix from `.goreleaser.yaml`, validates
 that configuration, and builds a single-target snapshot with the release builder
